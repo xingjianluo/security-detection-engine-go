@@ -21,13 +21,15 @@ import (
 // 审计：成功的状态变更、抑制合并与幂等命中各产生一条不可变 AuditEntry；
 // 被拒绝（越权/跨租户/非法转换）的尝试也记入拒绝审计，可追溯。
 type Store struct {
-	mu     sync.Mutex
-	clock  func() time.Time
-	alerts map[string]*Alert
-	audit  map[string][]AuditEntry // alertID -> 有序记录（成功/幂等变更视图）
-	all    []AuditEntry            // 全量有序审计链（含被拒绝尝试），序号无缺口
-	denied []AuditEntry            // 被拒绝操作视图
-	seq    int64
+	mu          sync.Mutex
+	clock       func() time.Time
+	alerts      map[string]*Alert
+	audit       map[string][]AuditEntry // alertID -> 有序记录（成功/幂等变更视图）
+	all         []AuditEntry            // 全量有序审计链（含被拒绝尝试），序号无缺口
+	denied      []AuditEntry            // 被拒绝操作视图
+	corrections map[string]*Correction  // correctionID -> 不可变更正记录
+	corrOrder   []string                // 更正记录 ID 的登记顺序
+	seq         int64
 }
 
 // NewStore 创建告警存储。clock 用于审计与状态变更时间（墙钟时间），nil 时取 time.Now。
@@ -35,7 +37,12 @@ func NewStore(clock func() time.Time) *Store {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Store{clock: clock, alerts: map[string]*Alert{}, audit: map[string][]AuditEntry{}}
+	return &Store{
+		clock:       clock,
+		alerts:      map[string]*Alert{},
+		audit:       map[string][]AuditEntry{},
+		corrections: map[string]*Correction{},
+	}
 }
 
 // Create 按检测结论创建告警。ID 必须全局唯一（引擎用确定性 FireID 派生）。
@@ -157,6 +164,11 @@ func (s *Store) transition(id string, op Operator, action, reason string,
 	a, ok := s.alerts[id]
 	if !ok {
 		return nil, ErrAlertNotFound
+	}
+	if a.Superseded {
+		// 已被回补更正取代的旧结论保留可查，但不再接受生命周期变更。
+		s.recordDeniedLocked(a, op, action, ErrAlertSuperseded)
+		return nil, ErrAlertSuperseded
 	}
 	if a.TenantID != op.TenantID {
 		s.recordDeniedLocked(a, op, action, ErrCrossTenant)

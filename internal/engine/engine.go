@@ -38,24 +38,43 @@ type Engine struct {
 	alerts     *alert.Store
 	parseCfg   event.ParseConfig
 	quarantine []event.QuarantineRecord
+
+	// 回补支持：
+	journal       []*event.Event           // 已纳入检测的全部事件（按到达追加，回补重放的事实来源）
+	journalIDs    map[string]bool          // 已在日志中的事件 ID（回补补入去重）
+	lateRecords   []*event.Event           // 被判迟到而隔离的可解析事件（回补候选）
+	lateClaimed   map[int]bool             // 已被某次回补认领的迟到记录下标
+	maxBackfillAge time.Duration           // 可回补的最大历史跨度（End-Start 上限）
+	backfills     map[string]*BackfillResult // RequestID -> 已处理结果（幂等）
 }
 
 // Config 引擎配置。
 type Config struct {
 	AllowedLateness time.Duration
 	Parse           event.ParseConfig
+	// MaxBackfillAge 限制单次回补允许覆盖的最大时间跨度（End-Start）；
+	// 零值取 DefaultMaxBackfillAge。
+	MaxBackfillAge time.Duration
 }
 
 // New 创建引擎，并返回其规则集（用于登记规则）与告警存储（用于生命周期操作）。
 func New(cfg Config) (*Engine, *detect.RuleSet, *alert.Store) {
 	rs := detect.NewRuleSet()
 	store := alert.NewStore(cfg.Parse.Now)
+	maxAge := cfg.MaxBackfillAge
+	if maxAge <= 0 {
+		maxAge = DefaultMaxBackfillAge
+	}
 	e := &Engine{
-		ingest:   event.NewIngestor(event.IngestConfig{AllowedLateness: cfg.AllowedLateness}),
-		corr:     detect.NewCorrelator(rs),
-		rules:    rs,
-		alerts:   store,
-		parseCfg: cfg.Parse,
+		ingest:         event.NewIngestor(event.IngestConfig{AllowedLateness: cfg.AllowedLateness}),
+		corr:           detect.NewCorrelator(rs),
+		rules:          rs,
+		alerts:         store,
+		parseCfg:       cfg.Parse,
+		journalIDs:     map[string]bool{},
+		lateClaimed:    map[int]bool{},
+		maxBackfillAge: maxAge,
+		backfills:      map[string]*BackfillResult{},
 	}
 	return e, rs, store
 }
@@ -88,7 +107,18 @@ func (e *Engine) Ingest(tenantID string, src event.Source, raw string) Result {
 		r.Reason = o.Quarantine.Reason
 		r.Detail = o.Quarantine.Detail
 		if o.Disposition == event.DispLate {
+			// 保留可解析的迟到事件本体，作为后续受控回补的候选来源。
+			if o.Event != nil {
+				e.lateRecords = append(e.lateRecords, o.Event)
+			}
 			e.quarantine = append(e.quarantine, *o.Quarantine)
+		}
+	}
+	if o.Disposition == event.DispAccepted {
+		// 事件日志：回补重放的事实来源；按 ID 去重，重复事件不进日志。
+		if !e.journalIDs[parsed.ID] {
+			e.journalIDs[parsed.ID] = true
+			e.journal = append(e.journal, parsed)
 		}
 	}
 	return r
@@ -135,7 +165,8 @@ func (e *Engine) materialize(ds []detect.Decision) []string {
 			a := alert.Alert{
 				ID: d.FireID, TenantID: d.TenantID, RuleID: d.RuleID,
 				RuleVersion: d.RuleVersion, Entity: d.Entity,
-				CreatedAt: d.FirstEventAt, EventIDs: append([]string{}, d.EventIDs...),
+				CreatedAt: d.FirstEventAt, FireAt: d.FireAt,
+				EventIDs: append([]string{}, d.EventIDs...),
 			}
 			if got, err := e.alerts.Create(a); err == nil && got.ID == d.FireID && len(got.EventIDs) == len(d.EventIDs) {
 				created = append(created, d.FireID)

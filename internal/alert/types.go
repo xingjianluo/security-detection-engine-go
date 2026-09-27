@@ -33,6 +33,18 @@ type Alert struct {
 	UpdatedAt       time.Time
 	EventIDs        []string // 合并的全部事件 ID（含抑制追加的）
 	SuppressedCount int      // 被抑制合并的命中次数
+	// FireAt 为阈值穿越点（窗口右端，事件时间）；CreatedAt 是窗口内最早事件时间。
+	// 回补按 FireAt 圈定窗口归属，使同一时间窗的结论可对齐、可比对。
+	FireAt time.Time
+	// Superseded 为 true 表示该结论已被一次回补更正取代；记录仍保留可查，
+	// 但不再是该（规则,实体,时间窗）的可见最终结论。
+	Superseded bool
+	// SupersededBy 指向取代它的更正记录 ID。
+	SupersededBy string
+	// IsCorrection 标记该告警是一次回补产生的更正结论（而非首次检测结论）。
+	IsCorrection bool
+	// CorrectionID 当 IsCorrection 时，指向对应更正记录 ID。
+	CorrectionID string
 }
 
 // Operator 描述一次操作的操作者。

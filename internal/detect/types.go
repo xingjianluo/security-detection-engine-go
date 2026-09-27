@@ -26,6 +26,7 @@ type Decision struct {
 	Entity       string
 	AlertKey     string    // 抑制键：RuleID + 实体
 	FirstEventAt time.Time // 触发告警所合并的最早事件时间（告警时间语义）
+	FireAt       time.Time // 阈值穿越点（窗口右端的事件时间），回补按它圈定窗口归属
 	EventIDs     []string  // 该告警合并的全部事件 ID（可追溯）
 	SuppressedBy string    // 非空时表示本次命中被该告警 ID 抑制（合并进既有告警）
 	IsAlert      bool      // 是否为新发告警（相对抑制命中）

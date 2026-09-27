@@ -140,7 +140,7 @@ func (c *Correlator) evalKey(k stateKey, st *keyState) []Decision {
 		alertKey := r.ID + "|" + k.entity
 		d := Decision{
 			RuleID: r.ID, RuleVersion: r.Version, TenantID: st.tenantID,
-			Entity: k.entity, AlertKey: alertKey,
+			Entity: k.entity, AlertKey: alertKey, FireAt: t,
 			FirstEventAt: merged[0].EventTime, EventIDs: ids,
 		}
 
