@@ -2,6 +2,7 @@ package alert
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -56,6 +57,9 @@ func (s *Store) Create(a Alert) (*Alert, error) {
 	now := s.clock().UTC()
 	a.CreatedAt = a.CreatedAt.UTC() // 事件时间语义：告警时间=合并的最早事件时间
 	a.UpdatedAt = now
+	if a.RootID == "" {
+		a.RootID = a.ID // 首发结论自成更正链根
+	}
 	if a.EventIDs == nil {
 		a.EventIDs = []string{}
 	}
@@ -104,6 +108,122 @@ func (s *Store) MergeSuppressed(alertID, tenantID string, eventIDs []string, fir
 		FromState: a.Status, ToState: a.Status, At: s.clock().UTC(),
 		Reason: "merged suppressed hit " + fireID + ": added " +
 			itoa(added) + " event(s)",
+	})
+	return nil
+}
+
+// Supersede 用于回补更正：把一条或多条原结论标记为【被替代】（superseded，
+// 原记录保留可查、可审计），并创建一条延续更正链（同一 RootID）的当前生效告警。
+// 整个动作原子、幂等：重复提交同一 (requestID, newAlertID) 返回既有替代告警，
+// 不重复标记、不重复审计。跨租户与越权（仅 operator/admin）被明确拒绝。
+func (s *Store) Supersede(req SupersedeRequest) (*Alert, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if req.NewAlert.TenantID == "" {
+		return nil, ErrInvalidTransition
+	}
+	// 幂等：同一更正告警 ID 已创建过 => 直接返回，不重复执行。
+	if ex, ok := s.alerts[req.NewAlert.ID]; ok {
+		if ex.TenantID != req.NewAlert.TenantID {
+			return nil, ErrCrossTenant
+		}
+		return ex, nil
+	}
+	if req.Operator.TenantID != req.NewAlert.TenantID {
+		s.recordDeniedLocked(nil, req.Operator, "supersede", ErrCrossTenant)
+		return nil, ErrCrossTenant
+	}
+	if req.Operator.Role != RoleAdmin && req.Operator.Role != RoleOperator {
+		s.recordDeniedLocked(nil, req.Operator, "supersede", ErrPermissionDenied)
+		return nil, ErrPermissionDenied
+	}
+
+	now := s.clock().UTC()
+	var rootID string
+	for _, oldID := range req.OldAlertIDs {
+		old, ok := s.alerts[oldID]
+		if !ok {
+			return nil, ErrAlertNotFound
+		}
+		if old.TenantID != req.NewAlert.TenantID {
+			s.recordDeniedLocked(old, req.Operator, "supersede", ErrCrossTenant)
+			return nil, ErrCrossTenant
+		}
+		if rootID == "" {
+			rootID = old.RootID
+		}
+	}
+
+	// 标记原结论被替代（保留记录，仅改可见性语义）。
+	for _, oldID := range req.OldAlertIDs {
+		old := s.alerts[oldID]
+		from := old.Status
+		old.Status = StatusSuperseded
+		old.SupersededBy = req.NewAlert.ID
+		old.SupersededAt = now
+		old.UpdatedAt = now
+		s.appendAuditLocked(AuditEntry{
+			AlertID: oldID, TenantID: old.TenantID, Action: "supersede",
+			OperatorID: req.Operator.ID, FromState: from, ToState: StatusSuperseded,
+			At: now, Reason: "superseded by correction " + req.NewAlert.ID +
+				" via backfill " + req.RequestID + ": " + req.Reason,
+		})
+	}
+
+	a := req.NewAlert
+	if rootID == "" {
+		rootID = a.ID // ChangeAdded：新结论自成更正链根
+	}
+	a.RootID = rootID
+	a.Status = StatusOpen
+	a.CreatedAt = a.CreatedAt.UTC()
+	a.UpdatedAt = now
+	if a.EventIDs == nil {
+		a.EventIDs = []string{}
+	}
+	stored := a
+	s.alerts[a.ID] = &stored
+	s.appendAuditLocked(AuditEntry{
+		AlertID: a.ID, TenantID: a.TenantID, Action: "correction_create",
+		OperatorID: req.Operator.ID, FromState: "", ToState: StatusOpen, At: now,
+		Reason: "correction from backfill " + req.RequestID + " replacing [" +
+			strings.Join(req.OldAlertIDs, ",") + "]: " + req.Reason,
+	})
+	return &stored, nil
+}
+
+// Revoke 用于回补重算后原结论不再成立的防御性情形：把原结论标记为
+// superseded 且不产生替代告警（更正记录中 NewAlertID 为空）。纯补数
+// （只新增事件）场景下不应发生；保留它是为了让"唯一可见结论"语义在任何
+// 重算结果下都成立。跨租户/越权与 Supersede 同样拒绝。
+func (s *Store) Revoke(oldAlertID, requestID string, op Operator, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, ok := s.alerts[oldAlertID]
+	if !ok {
+		return ErrAlertNotFound
+	}
+	if old.TenantID != op.TenantID {
+		s.recordDeniedLocked(old, op, "revoke", ErrCrossTenant)
+		return ErrCrossTenant
+	}
+	if op.Role != RoleAdmin && op.Role != RoleOperator {
+		s.recordDeniedLocked(old, op, "revoke", ErrPermissionDenied)
+		return ErrPermissionDenied
+	}
+	if old.Status == StatusSuperseded { // 幂等
+		return nil
+	}
+	now := s.clock().UTC()
+	from := old.Status
+	old.Status = StatusSuperseded
+	old.SupersededAt = now
+	old.UpdatedAt = now
+	s.appendAuditLocked(AuditEntry{
+		AlertID: oldAlertID, TenantID: old.TenantID, Action: "revoke",
+		OperatorID: op.ID, FromState: from, ToState: StatusSuperseded, At: now,
+		Reason: "revoked by backfill " + requestID + ": " + reason,
 	})
 	return nil
 }
@@ -166,6 +286,12 @@ func (s *Store) transition(id string, op Operator, action, reason string,
 		s.recordDeniedLocked(a, op, action, ErrPermissionDenied)
 		return nil, ErrPermissionDenied
 	}
+	// 已被回补更正替代的结论是不可变的历史记录，不再接受生命周期变更；
+	// 运维应对当前生效的替代告警（同 RootID）操作。
+	if a.Status == StatusSuperseded {
+		s.recordDeniedLocked(a, op, action, ErrInvalidTransition)
+		return nil, ErrInvalidTransition
+	}
 	from := a.Status
 	to, note, err := step(a)
 	if err != nil {
@@ -205,16 +331,31 @@ func (s *Store) Get(id string, op Operator) (*Alert, error) {
 	return &out, nil
 }
 
-// List 按租户列出告警（按创建事件时间排序）。
+// List 按租户列出【当前可见】告警（排除已被回补替代的 superseded 历史版本），
+// 保证同一 (租户,规则,实体,时间窗) 上可见结论唯一；按创建事件时间排序。
+// 需要查看含被替代历史版本的完整结论链时使用 ListAll。
 func (s *Store) List(tenantID string) []*Alert {
+	return s.list(tenantID, false)
+}
+
+// ListAll 按租户列出全部告警，含已被替代的历史版本（审计/追溯视图）。
+func (s *Store) ListAll(tenantID string) []*Alert {
+	return s.list(tenantID, true)
+}
+
+func (s *Store) list(tenantID string, includeSuperseded bool) []*Alert {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []*Alert
 	for _, a := range s.alerts {
-		if a.TenantID == tenantID {
-			cp := *a
-			out = append(out, &cp)
+		if a.TenantID != tenantID {
+			continue
 		}
+		if !includeSuperseded && a.Status == StatusSuperseded {
+			continue
+		}
+		cp := *a
+		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {

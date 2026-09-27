@@ -76,8 +76,9 @@ func (g *Ingestor) Admit(e *Event) Outcome {
 
 	if !g.asserted.IsZero() && !e.EventTime.After(g.asserted) {
 		rec := QuarantineRecord{
-			Raw: e.Raw, Source: e.Source, Disposition: DispLate,
-			Reason: RejectReason("late_event"),
+			Raw: e.Raw, Source: e.Source, TenantID: e.TenantID, EventID: e.ID,
+			Disposition: DispLate,
+			Reason:      RejectReason("late_event"),
 			Detail: "event_time=" + e.EventTime.Format(time.RFC3339Nano) +
 				" <= asserted_watermark=" + g.asserted.Format(time.RFC3339Nano),
 			ReceivedAt: e.ReceivedAt,

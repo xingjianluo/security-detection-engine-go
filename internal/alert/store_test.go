@@ -206,3 +206,65 @@ func TestCreateIdempotent(t *testing.T) {
 		t.Fatalf("create with conflicting tenant: %v", err)
 	}
 }
+
+// 回补更正：原结论 superseded 保留可查，替代告警沿同一 RootID；List 唯一可见。
+func TestSupersedeCorrection(t *testing.T) {
+	s := newTestStore(t)
+	op := Operator{ID: "op1", TenantID: "t1", Role: RoleOperator}
+	orig, err := s.Create(Alert{ID: "fire-1", TenantID: "t1", RuleID: "r", Entity: "alice",
+		CreatedAt: baseT, EventIDs: []string{"e1", "e2", "e3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repl, err := s.Supersede(SupersedeRequest{
+		RequestID:   "bf-1",
+		OldAlertIDs: []string{"fire-1"},
+		NewAlert: Alert{ID: "corr-1", TenantID: "t1", RuleID: "r", Entity: "alice",
+			RuleVersion: 1, CreatedAt: baseT, EventIDs: []string{"e1", "e2", "e2b", "e3"}},
+		Operator: op, Reason: "gap filled",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repl.RootID != orig.RootID || repl.Status != StatusOpen {
+		t.Fatalf("replacement must share root and be open: %+v", repl)
+	}
+	// 幂等：同一更正 ID 重复提交返回既有，不重复标记/审计。
+	repl2, err := s.Supersede(SupersedeRequest{
+		RequestID: "bf-1", OldAlertIDs: []string{"fire-1"},
+		NewAlert: Alert{ID: "corr-1", TenantID: "t1", RuleID: "r", Entity: "alice",
+			CreatedAt: baseT, EventIDs: []string{"e1"}},
+		Operator: op,
+	})
+	if err != nil || repl2.ID != "corr-1" {
+		t.Fatalf("idempotent supersede: %+v %v", repl2, err)
+	}
+	old, _ := s.Get("fire-1", op)
+	if old.Status != StatusSuperseded || old.SupersededBy != "corr-1" {
+		t.Fatalf("original must be superseded: %+v", old)
+	}
+	// List 只返回当前可见；ListAll 含历史。
+	if len(s.List("t1")) != 1 || s.List("t1")[0].ID != "corr-1" {
+		t.Fatalf("visible list must contain only correction")
+	}
+	if len(s.ListAll("t1")) != 2 {
+		t.Fatalf("ListAll must keep original + correction")
+	}
+	// 被替代结论不再接受生命周期变更。
+	if _, err := s.Ack("fire-1", op, ""); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("ack superseded must be invalid transition, got %v", err)
+	}
+	// 跨租户与越权拒绝。
+	if _, err := s.Supersede(SupersedeRequest{RequestID: "x",
+		NewAlert: Alert{ID: "c2", TenantID: "t2", CreatedAt: baseT},
+		Operator: op}); !errors.Is(err, ErrCrossTenant) {
+		t.Fatalf("cross-tenant supersede: %v", err)
+	}
+	viewer := Operator{ID: "v", TenantID: "t1", Role: RoleViewer}
+	if _, err := s.Supersede(SupersedeRequest{RequestID: "x",
+		NewAlert: Alert{ID: "c3", TenantID: "t1", CreatedAt: baseT},
+		Operator: viewer}); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("viewer supersede: %v", err)
+	}
+}

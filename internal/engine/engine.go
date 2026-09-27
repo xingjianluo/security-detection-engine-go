@@ -4,10 +4,12 @@ package engine
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/xingjianluo/security-detection-engine-go/internal/alert"
+	"github.com/xingjianluo/security-detection-engine-go/internal/backfill"
 	"github.com/xingjianluo/security-detection-engine-go/internal/detect"
 	"github.com/xingjianluo/security-detection-engine-go/internal/event"
 )
@@ -28,7 +30,7 @@ type Result struct {
 	Detail      string
 }
 
-// Engine 并发安全：单一互斥锁把解析、判定、检测提交串行化，
+// Engine 并发安全：单一互斥锁把解析、判定、检测提交与回补串行化，
 // 因此检测结论只依赖事件时间语义，与 goroutine 调用顺序无关。
 type Engine struct {
 	mu         sync.Mutex
@@ -38,12 +40,32 @@ type Engine struct {
 	alerts     *alert.Store
 	parseCfg   event.ParseConfig
 	quarantine []event.QuarantineRecord
+	// journal 记录每个租户所有已纳入检测的事件（正常释放 + 回补补入），
+	// 按 (事件时间,实体,ID) 有序；回补在此日志上做 shadow 重算。
+	journal map[string][]*event.Event
+	// known 是全租户事件去重索引（ID -> 租户），回补候选据此跳过已纳入事件。
+	known map[string]string
+	// anchors 记录每个结论组【锚点事件 ID】-> 当前生效告警 ID：
+	// 回补据此把 shadow 的确定性 FireID 解析为真实（可能已被更正的）告警。
+	anchors   map[string]anchorInfo
+	backfills *backfill.Service
+	clock     func() time.Time
+	maxAge    time.Duration
+}
+
+type anchorInfo struct {
+	alertID  string
+	alertKey string
+	tenantID string
 }
 
 // Config 引擎配置。
 type Config struct {
 	AllowedLateness time.Duration
 	Parse           event.ParseConfig
+	// MaxBackfillAge 受控回补的最大历史跨度（From 不得早于 now-MaxBackfillAge）；
+	// 零值表示不限制年龄，但 To 仍不得越过当前已断言水位。
+	MaxBackfillAge time.Duration
 }
 
 // New 创建引擎，并返回其规则集（用于登记规则）与告警存储（用于生命周期操作）。
@@ -56,7 +78,13 @@ func New(cfg Config) (*Engine, *detect.RuleSet, *alert.Store) {
 		rules:    rs,
 		alerts:   store,
 		parseCfg: cfg.Parse,
+		journal:  map[string][]*event.Event{},
+		known:    map[string]string{},
+		anchors:  map[string]anchorInfo{},
+		clock:    cfg.Parse.Now,
+		maxAge:   cfg.MaxBackfillAge,
 	}
+	e.backfills = backfill.NewService()
 	return e, rs, store
 }
 
@@ -119,6 +147,7 @@ func (e *Engine) releaseLocked(released []*event.Event) []string {
 	}
 	for _, ev := range released {
 		e.corr.Observe(ev)
+		e.appendJournalLocked(ev) // 事件进入租户日志，供后续回补重算
 	}
 	W := e.ingest.Watermark().T()
 	if W.IsZero() {
@@ -127,7 +156,30 @@ func (e *Engine) releaseLocked(released []*event.Event) []string {
 	return e.materialize(e.corr.AdvanceWatermark(W))
 }
 
+// appendJournalLocked 把事件按 (事件时间,实体,ID) 有序并入租户日志并登记去重索引。
+func (e *Engine) appendJournalLocked(ev *event.Event) {
+	if _, ok := e.known[ev.ID]; ok {
+		return
+	}
+	e.known[ev.ID] = ev.TenantID
+	js := e.journal[ev.TenantID]
+	pos := sort.Search(len(js), func(i int) bool {
+		if !js[i].EventTime.Equal(ev.EventTime) {
+			return js[i].EventTime.After(ev.EventTime)
+		}
+		if js[i].Entity != ev.Entity {
+			return js[i].Entity > ev.Entity
+		}
+		return js[i].ID >= ev.ID
+	})
+	js = append(js, nil)
+	copy(js[pos+1:], js[pos:])
+	js[pos] = ev
+	e.journal[ev.TenantID] = js
+}
+
 // materialize 把检测结论物化为告警：新发结论 Create；抑制命中合并到主告警。
+// 同时登记结论组锚点（组内最早事件 ID -> 当前生效告警），供回补解析更正对象。
 func (e *Engine) materialize(ds []detect.Decision) []string {
 	var created []string
 	for _, d := range ds {
@@ -139,6 +191,9 @@ func (e *Engine) materialize(ds []detect.Decision) []string {
 			}
 			if got, err := e.alerts.Create(a); err == nil && got.ID == d.FireID && len(got.EventIDs) == len(d.EventIDs) {
 				created = append(created, d.FireID)
+			}
+			if len(d.EventIDs) > 0 {
+				e.anchors[d.EventIDs[0]] = anchorInfo{alertID: d.FireID, alertKey: d.AlertKey, tenantID: d.TenantID}
 			}
 		} else {
 			_ = e.alerts.MergeSuppressed(d.SuppressedBy, d.TenantID, d.EventIDs, d.FireID)

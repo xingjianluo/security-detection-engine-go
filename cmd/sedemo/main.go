@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/xingjianluo/security-detection-engine-go/internal/alert"
+	"github.com/xingjianluo/security-detection-engine-go/internal/backfill"
 	"github.com/xingjianluo/security-detection-engine-go/internal/detect"
 	"github.com/xingjianluo/security-detection-engine-go/internal/engine"
 	"github.com/xingjianluo/security-detection-engine-go/internal/event"
@@ -83,7 +84,58 @@ func main() {
 	late := eng.Ingest("tenant-a", event.SourceJSON, jsonRec("L1", "alice", 30*time.Second))
 	fmt.Printf("  late e t+30s -> %s (%s) %s\n", late.Disposition, late.Reason, late.Detail)
 
-	fmt.Println("\n---- 4) 规则运行中更新：v2（阈值5）自事件时间 t+8m 生效，历史结论不被改写 ----")
+	fmt.Println("\n---- 4) 受控回补：上游补齐后，把迟到隔离的记录重新纳入并更正结论 ----")
+	// 场景：dave 在 t+4m..4m20s 有 3 次失败，前两条先到，水位推进后第 3 条才补发 => 迟到隔离。
+	eng.Ingest("tenant-a", event.SourceJSON, jsonRec("d1", "dave", 4*time.Minute))
+	eng.Ingest("tenant-a", event.SourceJSON, jsonRec("d2", "dave", 4*time.Minute+10*time.Second))
+	eng.Advance(base.Add(5 * time.Minute)) // 只有2条，未达阈值3 => 无结论
+	lateD3 := eng.Ingest("tenant-a", event.SourceJSON, jsonRec("d3", "dave", 4*time.Minute+20*time.Second))
+	fmt.Printf("  d3（t+4m20s）到达时水位已过 t+5m -> %s（隔离，不参与检测）\n", lateD3.Disposition)
+	if dave := store.List("tenant-a"); len(dave) == 0 {
+		fmt.Println("  回补前 dave 无任何可见结论")
+	}
+
+	bfOp := alert.Operator{ID: "ops-1", TenantID: "tenant-a", Role: alert.RoleOperator}
+	bf := eng.Backfill(backfill.Request{
+		RequestID: "bf-demo-1", TenantID: "tenant-a",
+		From: base.Add(4 * time.Minute), To: base.Add(5 * time.Minute),
+		Operator: bfOp, Reason: "upstream re-delivered d3 after recovery",
+	})
+	fmt.Printf("  回补结果: status=%s replayed=%v 补入事件=%v\n",
+		bf.Status, bf.Replayed, bf.Backfilled)
+	for _, c := range bf.Corrections {
+		fmt.Printf("  更正 kind=%s rule=v%d window=%s..%s\n    原结论=%v 新结论=%s\n    补入=%v 全部合并=%v\n    依据=%s\n",
+			c.Kind, c.RuleVersion, c.WindowFrom.Format(time.RFC3339Nano), c.WindowTo.Format(time.RFC3339Nano),
+			c.OldAlertIDs, c.NewAlertID, c.AddedEventIDs, c.AllEventIDs, c.Note)
+	}
+	// 同一请求重复发起：幂等，不重复更正。
+	bf2 := eng.Backfill(backfill.Request{
+		RequestID: "bf-demo-1", TenantID: "tenant-a",
+		From: base.Add(4 * time.Minute), To: base.Add(5 * time.Minute), Operator: bfOp,
+	})
+	fmt.Printf("  重复发起同一回补: status=%s replayed=%v 更正数=%d（不双算、不重复告警）\n",
+		bf2.Status, bf2.Replayed, len(bf2.Corrections))
+	// 拒绝示例：越过当前水位 / 跨租户。
+	denied := eng.Backfill(backfill.Request{
+		RequestID: "bf-demo-bad", TenantID: "tenant-a",
+		From: base, To: base.Add(time.Hour), Operator: bfOp,
+	})
+	fmt.Printf("  越水位回补: status=%s err=%v\n", denied.Status, denied.Err)
+	deniedT := eng.Backfill(backfill.Request{
+		RequestID: "bf-demo-x", TenantID: "tenant-a",
+		From: base.Add(4 * time.Minute), To: base.Add(5 * time.Minute),
+		Operator: alert.Operator{ID: "ops-x", TenantID: "tenant-b", Role: alert.RoleAdmin},
+	})
+	fmt.Printf("  跨租户回补: status=%s err=%v\n", deniedT.Status, deniedT.Err)
+	// 原结论保留可查（ListAll 含历史），可见结论唯一（List）。
+	fmt.Println("  当前可见的 dave 结论（唯一）:")
+	for _, a := range store.List("tenant-a") {
+		if a.Entity == "dave" {
+			fmt.Printf("    %s root=%s merged=%v\n", a.ID, a.RootID, a.EventIDs)
+		}
+	}
+
+	fmt.Println("\n---- 5) 规则运行中更新：v2（阈值5）自事件时间 t+8m 生效，历史结论不被改写 ----")
 	upd := []string{
 		jsonRec("u1", "alice", 8*time.Minute),
 		jsonRec("u2", "alice", 8*time.Minute+10*time.Second),
@@ -97,7 +149,7 @@ func main() {
 	eng.Advance(base.Add(7 * time.Minute))
 	fmt.Println("  v2 事件到来前推进水位到 t+7m，历史 v1 告警保持不变")
 
-	fmt.Println("\n---- 5) 并发写入：2 个 goroutine 各写事件，结论唯一 ----")
+	fmt.Println("\n---- 6) 并发写入：2 个 goroutine 各写事件，结论唯一 ----")
 	// 先并发写入 6 个 t+11m 的事件（在水位 t+7m 之后，不会被判迟到），
 	// 再补齐 u1..u4 并统一断言水位到 t+12m；v2 阈值 5 => carol 产生 1 条新告警。
 	var wg sync.WaitGroup
@@ -116,7 +168,7 @@ func main() {
 	fired = eng.Advance(base.Add(12 * time.Minute))
 	fmt.Println("  并发写入 + v2 事件(alice 4次未达阈值5)后新发告警:", fired)
 
-	fmt.Println("\n---- 6) 告警生命周期：确认/关闭/重开幂等，越权与跨租户被拒绝 ----")
+	fmt.Println("\n---- 7) 告警生命周期：确认/关闭/重开幂等，越权与跨租户被拒绝 ----")
 	op := func(id, tenant string, role alert.Role) alert.Operator {
 		return alert.Operator{ID: id, TenantID: tenant, Role: role}
 	}
@@ -147,7 +199,7 @@ func main() {
 		show("Reopen 重复(幂等)", e, a)
 	}
 
-	fmt.Println("\n---- 7) 最终告警与审计 ----")
+	fmt.Println("\n---- 8) 最终告警与审计 ----")
 	for _, a := range store.List("tenant-a") {
 		fmt.Printf("  告警 %s\n    rule=v%d entity=%s status=%s created(event_time)=%s\n    合并事件=%v suppress_merged=%d\n",
 			a.ID, a.RuleVersion, a.Entity, a.Status, a.CreatedAt.Format(time.RFC3339Nano),
@@ -168,7 +220,7 @@ func main() {
 			d.Seq, d.TenantID, d.Action, d.OperatorID, d.Reason)
 	}
 
-	fmt.Println("\n---- 8) 隔离区（拒绝 + 迟到，均未静默丢弃） ----")
+	fmt.Println("\n---- 9) 隔离区（拒绝 + 迟到，均未静默丢弃） ----")
 	for _, q := range eng.Quarantine() {
 		fmt.Printf("  %-9s reason=%-20s %s\n", q.Disposition, q.Reason, q.Detail)
 	}

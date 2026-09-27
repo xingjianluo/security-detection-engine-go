@@ -135,21 +135,123 @@ closed --Ack-->     错误 ErrInvalidTransition（须先 Reopen）
   全局序号连续无缺口；`DeniedAttempts()` 提供拒绝视图。
 - 记录含操作者、租户、起止状态、墙钟时间与原因（「谁在什么时候因为什么改了什么」）。
 
-## 4. 并发模型
+## 4. 受控历史回补（Backfill）与结论更正
 
-- `Engine` 以单一互斥锁串行化 `Ingest / Advance / Tick`：解析、入口判定、检测提交、
-  告警物化在临界区内顺序完成；`alert.Store` 亦自带锁。
-- 因此无论多少 goroutine、以何种交错顺序写入，只要喂入的**事件集合相同**
+上游日志源头偶尔补发、或延迟很久才把某段数据送来。这些记录按在线语义会判迟到隔离。
+回补提供一个**受控入口**：运维确认上游补齐后，主动发起一次回补，把指定范围内之前
+隔离的记录重新纳入检测。实现见 `internal/engine/backfill.go`、`internal/backfill/`。
+
+### 4.1 适用范围与边界
+
+- **按 `(租户, 时间段)` 圈定**：请求只携带 `TenantID + [From,To]`，只处理该租户、
+  事件时间落在闭区间内、且此前因**迟到**被隔离的记录。解析失败（rejected）不属于
+  回补对象——它们不是"晚到"，而是报文本身不合法。
+- **只重算、不改在线状态**：回补在**隔离的临时关联器**上对事件日志做 shadow 重放，
+  不触碰在线水位、在线累计器、在线抑制状态。因此回补进行时新事件照常写入/查询，
+  其他租户、其他时间段已定的结论不会跟着变。
+- **`To` 不得越过当前已断言水位**：那段结论尚未定论，回补它没有意义（返回
+  `ErrRangeNotFinalized`）。`From` 不得早于 `now - MaxBackfillAge`
+  （配置项；零值表示不限年龄），返回 `ErrBeyondHorizon`。
+- **按事件时间选规则版本**：补进来的历史记录按它**自己的事件时间**匹配当时生效的
+  规则版本（复用 `RuleSet.EffectiveAt`），不会因为规则现在已改成新版就套用新版。
+- 回补是一次性受控操作，不是放开迟到限制：在线 `Ingest` 的迟到/去重语义不变。
+
+### 4.2 不双算、不重复告警
+
+- **事件级去重**：引擎维护全量事件日志（正常释放 + 历次回补补入）与去重索引。
+  回补候选若已在日志中（正常事件重投、或已被更早的回补纳入），一律跳过并在
+  `Result.SkippedDup` 交代，绝不二次计数。
+- **请求级幂等**：`RequestID` 是调用方提供的幂等键。同一请求重复发起（或并发
+  同时提交）只真正执行一次，其余返回 `Replayed=true` 的同一结果，不重复产出。
+- **重叠回补**：不同 `RequestID` 但范围重叠时，后执行的重算其基线已包含先前补入
+  的事件，结论一致即返回 `accepted_unchanged`，不会再产生一条矛盾告警。
+- 回补与在线写入共用引擎同一把全局锁串行化，配合上述去重，并发跑完终态唯一。
+
+### 4.3 更正语义：原结论保留，可见结论唯一
+
+回补**绝不悄悄改写或删除原结论**。重算后在同一 `(租户,规则,实体,时间窗)` 上：
+
+- 原告警被标记为 `superseded`（新增的生命周期状态）：记录保留、可 `Get`、可查
+  审计，并通过 `SupersededBy` 指向当前生效结论；但不再是"可见最终版"。
+- 更正产生一条新告警，与原结论共享同一 `RootID`（更正链），状态从 `open` 起，
+  其 `EventIDs` 是补数后该窗口合并的**全部**事件，`SuppressedCount` 记抑制合并数。
+- `Store.List` 只返回当前可见结论（排除 superseded），因此同一时间窗上**可见结论
+  唯一**；`Store.ListAll` 返回含历史版本的完整结论链供追溯。
+- 被替代的历史结论不再接受 Ack/Close/Reopen（返回 `ErrInvalidTransition`）；
+  运维应对当前生效的替代告警操作。
+
+更正有三种类型（`Correction.Kind`），都记录原结论、补入事件、窗口起止与依据：
+
+| Kind | 含义 |
+| --- | --- |
+| `added` | 原时间窗上没有结论，补入事件后新窗口首次成立，新增一条更正告警 |
+| `revised` | 原时间窗上已有告警，补入事件后窗口/合并事件/规则版本变化，原结论被同 RootID 的替代告警取代 |
+| `revoked` | 原结论在重算后不再成立（防御性；纯补数只会新增事件，理论上不出现） |
+
+shadow 重算按"结论组"对齐（一次新发告警 + 其后到下一次新发之间的全部抑制命中
+构成一个结论组），组身份锚点是首发窗口的第一个事件 ID——它跨重算稳定。规划器
+`backfill.PlanChanges` 是纯函数（不碰存储/水位/墙钟），只依赖两组 Decision、事件
+集合与区间，因此更正结果可复现、可单测。
+
+### 4.4 请求结果三态（调用方无需猜测）
+
+| `Result.Status` | 含义 |
+| --- | --- |
+| `accepted_changed` | 被接受且**真的改变**了可见结论（`Corrections` 非空） |
+| `accepted_unchanged` | 被接受但重算结论与现状一致（无新事件/补了也不影响结论），**不产生任何告警或审计噪音** |
+| `rejected` | 被拒绝，`Result.Err` 为可区分原因（见下） |
+
+可区分的拒绝原因（`internal/backfill` 的 sentinel error）：
+
+- `ErrInvalidRange`：区间非法（空、`From>To`、缺租户/RequestID）。
+- `ErrRangeNotFinalized`：`To` 越过当前水位。
+- `ErrBeyondHorizon`：早于可回补下限。
+- `ErrCrossTenant`：操作者租户与目标租户不一致（复用 `alert.ErrCrossTenant`）。
+- `ErrPermissionDenied`：仅 `operator`/`admin` 可发起（viewer 拒绝）。
+
+`Result` 还交代：`Backfilled`（实际纳入的事件）、`SkippedDup`（重复跳过）、
+`Advisories`（不改变结论但需说明的边界影响，如补入事件被区间外窗口吸收——此时
+区间外结论保持不变，仅给提示）。
+
+### 4.5 本地复现
+
+```go
+eng, rules, store := engine.New(engine.Config{AllowedLateness: 30*time.Second, MaxBackfillAge: 24*time.Hour, Parse: ...})
+// ... 正常喂事件、Advance 推进水位；迟到事件进入隔离 ...
+
+res := eng.Backfill(backfill.Request{
+    RequestID: "bf-001", TenantID: "t1",
+    From: base, To: base.Add(2*time.Minute),
+    Operator: alert.Operator{ID: "ops", TenantID: "t1", Role: alert.RoleOperator},
+    Reason:   "upstream re-delivered after recovery",
+})
+res.Status // accepted_changed / accepted_unchanged / rejected
+res.Corrections // OldAlertIDs -> NewAlertID、AddedEventIDs、AllEventIDs、窗口、规则版本、依据
+store.List("t1")     // 当前可见结论（唯一）
+store.ListAll("t1")  // 含 superseded 历史版本的完整结论链
+```
+
+## 5. 并发模型
+
+- `Engine` 以单一互斥锁串行化 `Ingest / Advance / Tick / Backfill`：解析、入口判定、
+  检测提交、告警物化与回补的 shadow 重算/更生物化在临界区内顺序完成；`alert.Store`
+  与 `backfill.Service` 亦自带锁。
+- 因此无论多少 goroutine、以何种交错顺序写入或发起回补，只要喂入的**事件集合相同**
   且最终断言水位相同，规则选择、窗口累计、抑制与告警 ID、合并事件集合就完全一致
-  （见 `TestEngineConcurrentWritersConsistent`，`go test -race` 验证无数据竞争）。
+  （见 `TestEngineConcurrentWritersConsistent`、`TestBackfillConcurrent`，
+  `go test -race` 验证无数据竞争）。
+- 唯一的非确定项：多个**不同 `RequestID`** 的重叠回补并发时，谁先被串行调度谁生效；
+  但无论谁先，最终同一时间窗上都只有一条可见结论。需要跨调度完全相同的更正 ID 时，
+  让重复提交共享同一 `RequestID`（幂等）。
 
-## 5. 验证方法
+## 6. 验证方法
 
 ```bash
 go test ./...                 # 全量单测
 go test -race ./...           # 竞态检测
-go test -v ./internal/...     # 查看含事件序列/时间基准/判定依据的日志
-go run ./cmd/sedemo           # 端到端演示（乱序/重复/并发/规则更新/权限/审计/隔离）
+go test -v ./internal/...     # 查看含事件序列/时间基准/判定依据/更正依据的日志
+go test ./internal/engine/ -run Backfill -v   # 只跑回补与更正用例
+go run ./cmd/sedemo           # 端到端演示（乱序/重复/并发/回补更正/规则更新/权限/审计/隔离）
 ```
 
 测试覆盖矩阵：
@@ -160,9 +262,11 @@ go run ./cmd/sedemo           # 端到端演示（乱序/重复/并发/规则更
 | 乱序到达结论一致、重复投递、迟到、Tick、Flush 语义 | `event/ingest_test.go` |
 | 规则版本化、EffectiveAt 选择、非法版本 | `detect/ruleset_test.go` |
 | 阈值触发、窗口滑动、抑制合并、版本不混算、水位幂等、实体/租户 | `detect/correlator_test.go` |
-| 生命周期幂等、角色、跨租户、非法转换、审计链、并发唯一终态、合并幂等 | `alert/store_test.go` |
+| 生命周期幂等、角色、跨租户、非法转换、审计链、并发唯一终态、合并幂等、**superseded 更正** | `alert/store_test.go` |
 | 乱序+重复+多来源可复现、拒绝/迟到可区分、并发写入一致、未完成窗口收尾 | `engine/engine_test.go` |
+| **差异规划：新增/更正/不变**（纯函数对齐、锚点、抑制计数） | `backfill/planner_test.go` |
+| **回补端到端**：迟到补入新增更正、原结论 revised 且唯一可见、结论不变无噪音、幂等、重叠不双算、拒绝五分类、跨租户隔离、并发回补、按事件时间选版本 | `engine/backfill_test.go` |
 
 单测日志会打印：时间基准（`time_base`）、断言水位、事件释放/合并序列、
 判定依据（`Decision.Reason`：阈值、窗口、右端时间、规则版本、FireID）、
-重复/迟到计数与隔离原因。
+重复/迟到计数与隔离原因、回补的补入事件/窗口变化/原结论→新结论的更正依据。

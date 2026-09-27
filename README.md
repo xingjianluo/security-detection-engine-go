@@ -2,7 +2,9 @@
 
 用本地事件流模拟多来源安全日志采集，在**乱序到达、重复投递、并发写入**下给出
 **一致且可解释**的检测结论：事件归一化 → 事件时间水位与迟到/去重判定 →
-滑动窗口有状态关联与告警抑制 → 告警生命周期、租户隔离与审计。
+滑动窗口有状态关联与告警抑制 → 告警生命周期、租户隔离与审计；并提供**受控的历史
+回补入口**：上游补发后按 `(租户,时间段)` 把曾迟到隔离的记录重新纳入，以
+**更正（而非悄悄改写）**的形式更新结论，原结论保留可查、可见结论唯一。
 
 ## 架构
 
@@ -17,15 +19,21 @@
         │  Decision（新发告警 / 抑制命中，确定性 FireID，携带合并事件 ID）
         ▼
   alert.Store（幂等 Ack/Close/Reopen · 角色与租户隔离 · 全量审计链）
+
+  迟到隔离记录 ── Backfill(租户,时间段,RequestID) ── 事件日志 shadow 重算
+        │  按事件时间选规则版本 · 事件级去重 · RequestID 幂等 · 重叠不双算
+        ▼
+  更正 Correction（原结论 superseded 保留可查 · 同 RootID 替代告警 · 可见结论唯一）
 ```
 
 | 包 | 职责 |
 | --- | --- |
 | `internal/event` | 多来源解析与归一化；拒绝原因分类；去重、迟到、显式水位、确定性排序释放 |
 | `internal/detect` | 版本化规则集；滑动窗口累计阈值；抑制与合并；按事件时间选择规则版本 |
-| `internal/alert` | 告警状态机（幂等）；租户隔离与角色权限；不可变审计（含拒绝尝试） |
-| `internal/engine` | 并发安全编排（单锁串行化），物化检测结论为告警，维护隔离区 |
-| `cmd/sedemo` | 端到端演示程序 |
+| `internal/alert` | 告警状态机（幂等）；租户隔离与角色权限；不可变审计（含拒绝尝试）；更正时原结论 superseded、同 RootID 替代 |
+| `internal/backfill` | 回补请求的参数/权限校验、幂等注册表，以及纯函数的重算差异规划（结论组对齐/新增/更正） |
+| `internal/engine` | 并发安全编排（单锁串行化），物化检测结论为告警，维护事件日志与隔离区，并在 shadow 关联器上执行受控回补与更生物化 |
+| `cmd/sedemo` | 端到端演示程序（含回补更正） |
 
 ## 快速开始
 
@@ -65,5 +73,27 @@ store.AuditLog(alertID, op)             // 完整状态变更轨迹
 - **规则热更新安全**：新版本只影响 `EffectiveAt` 之后的事件，历史结论不被静默改写；窗口不跨版本混算。
 - **生命周期**：Ack/Close/Reopen 幂等；跨租户与越权被明确拒绝；所有变更与拒绝均有审计。
 - **并发唯一**：单锁串行化 + 状态存储自带锁，`-race` 下并发写入终态唯一。
+- **受控回补**：`Backfill(租户,时间段,RequestID)` 只把该范围内曾迟到隔离的记录在
+  shadow 关联器上重算；按事件时间选当时规则版本；事件级去重 + RequestID 幂等 +
+  重叠不双算；结果三态可区分（`accepted_changed` / `accepted_unchanged` / `rejected`）。
+- **更正可追溯、结论唯一**：回补不删改原结论——原告警置 `superseded` 保留可查，
+  更正告警沿同一 `RootID` 交代原结论、补入事件与窗口变化；同一
+  `(租户,规则,实体,时间窗)` 上 `List` 可见结论始终唯一。
+
+```go
+res := eng.Backfill(backfill.Request{
+    RequestID: "bf-001", TenantID: "t1",
+    From: base, To: base.Add(2 * time.Minute),
+    Operator: alert.Operator{ID: "ops", TenantID: "t1", Role: alert.RoleOperator},
+    Reason:   "upstream re-delivered after recovery",
+})
+res.Status // accepted_changed / accepted_unchanged / rejected(Err 可区分)
+for _, c := range res.Corrections { // OldAlertIDs -> NewAlertID、补入事件、窗口、规则版本、依据
+    fmt.Println(c.Kind, c.OldAlertIDs, "->", c.NewAlertID, c.Note)
+}
+store.List("t1")    // 当前可见结论（唯一）
+store.ListAll("t1") // 含 superseded 历史版本的完整结论链
+```完整结论链
+```
 
 详细语义、状态机、边界约定与验证矩阵见 [`docs/DESIGN.md`](docs/DESIGN.md)。

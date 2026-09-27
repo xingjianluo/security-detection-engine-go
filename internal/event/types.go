@@ -53,12 +53,16 @@ const (
 
 // QuarantineRecord 记录被拒绝或被隔离（迟到）的事件，保证不静默丢弃。
 type QuarantineRecord struct {
-	Raw         string
-	Source      Source
-	Disposition Disposition
-	Reason      RejectReason
-	Detail      string
-	ReceivedAt  time.Time
+	Raw          string
+	Source       Source
+	TenantID     string // 归属租户（迟到记录是回补的候选来源，需按租户圈定）
+	EventID      string // 归一化事件 ID（迟到记录可用，便于去重与回补追溯）
+	Disposition  Disposition
+	Reason       RejectReason
+	Detail       string
+	ReceivedAt   time.Time
+	BackfilledBy string // 非空表示该迟到记录已被某次回补请求重新纳入（请求 ID）
+	BackfilledAt time.Time
 }
 
 // Outcome 是一条原始记录经过入口判定后的结果，四种去向互斥。
