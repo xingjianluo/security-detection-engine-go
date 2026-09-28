@@ -76,12 +76,12 @@ type RawRecord struct {
 
 // BackfillResult 是回补请求的明确结果。
 type BackfillResult struct {
-	Status       BackfillStatus
-	Request      BackfillRequest
-	Reject       error                // Status==rejected 时非空（可区分原因）
-	Corrections  []alert.Correction   // applied 时本次产生的更正
+	Status         BackfillStatus
+	Request        BackfillRequest
+	Reject         error              // Status==rejected 时非空（可区分原因）
+	Corrections    []alert.Correction // applied 时本次产生的更正
 	ReplayedEvents []string           // 本次实际纳入重算的补入事件 ID（去重后）
-	SkippedExtra []SkippedRecord      // 补投记录中无法解析/越界被跳过的条目
+	SkippedExtra   []SkippedRecord    // 补投记录中无法解析/越界被跳过的条目
 }
 
 // SkippedRecord 描述回补补投记录中被跳过的一条。
@@ -455,8 +455,8 @@ func (e *Engine) diffGroupLocked(g replayGroup, req BackfillRequest, added map[s
 		rep = &d
 	}
 	a := alert.Alert{
-		ID:          "corr:" + rep.FireID + ":" + req.RequestID,
-		TenantID:    g.tenantID, RuleID: rep.RuleID, RuleVersion: rep.RuleVersion,
+		ID:       "corr:" + rep.FireID + ":" + req.RequestID,
+		TenantID: g.tenantID, RuleID: rep.RuleID, RuleVersion: rep.RuleVersion,
 		Entity: rep.Entity, CreatedAt: rep.FirstEventAt, FireAt: rep.FireAt,
 		EventIDs: append([]string{}, rep.EventIDs...),
 	}
@@ -471,12 +471,13 @@ func (e *Engine) diffGroupLocked(g replayGroup, req BackfillRequest, added map[s
 // 基线重放用的是全新关联器，FireID 的"该键第几次新发"序号与在线一致，
 // 但更正后的再次重放会让旧 FireID 指向已被取代的告警——这里统一通过
 // （规则,实体,穿越点 FireAt,合并事件集合）在存储中找到当前可见或已取代的原告警。
+// 注意必须在"含已取代旧结论"的全量快照里查找，不能用活跃视图 List。
 // 调用方持锁。
 func (e *Engine) resolveAlertIDLocked(d detect.Decision) string {
 	want := sig(d.EventIDs)
 	var candidate string
-	for _, a := range e.alerts.List(d.TenantID) {
-		if a.RuleID != d.RuleID || a.Entity != d.Entity {
+	for _, a := range e.alerts.AllAlertsForResolve() {
+		if a.RuleID != d.RuleID || a.Entity != d.Entity || a.TenantID != d.TenantID {
 			continue
 		}
 		if sig(a.EventIDs) == want {

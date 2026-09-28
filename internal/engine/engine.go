@@ -40,12 +40,12 @@ type Engine struct {
 	quarantine []event.QuarantineRecord
 
 	// 回补支持：
-	journal       []*event.Event           // 已纳入检测的全部事件（按到达追加，回补重放的事实来源）
-	journalIDs    map[string]bool          // 已在日志中的事件 ID（回补补入去重）
-	lateRecords   []*event.Event           // 被判迟到而隔离的可解析事件（回补候选）
-	lateClaimed   map[int]bool             // 已被某次回补认领的迟到记录下标
-	maxBackfillAge time.Duration           // 可回补的最大历史跨度（End-Start 上限）
-	backfills     map[string]*BackfillResult // RequestID -> 已处理结果（幂等）
+	journal        []*event.Event             // 已纳入检测的全部事件（按到达追加，回补重放的事实来源）
+	journalIDs     map[string]bool            // 已在日志中的事件 ID（回补补入去重）
+	lateRecords    []*event.Event             // 被判迟到而隔离的可解析事件（回补候选）
+	lateClaimed    map[int]bool               // 已被某次回补认领的迟到记录下标
+	maxBackfillAge time.Duration              // 可回补的最大历史跨度（End-Start 上限）
+	backfills      map[string]*BackfillResult // RequestID -> 已处理结果（幂等）
 }
 
 // Config 引擎配置。

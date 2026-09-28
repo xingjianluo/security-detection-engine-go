@@ -18,6 +18,13 @@ import (
 //	closed --Reopen--> open     （open/acked 重复 Reopen => 幂等命中）
 //	closed --Ack-->    错误 ErrInvalidTransition（须先 Reopen）
 //
+// 任意活跃状态 --回补更正--> superseded（终态：保留可查，不再可处置、不出现在 List）
+//
+// 查询语义：
+//   - List 只返回"当前有效的最终结论"（未被更正取代），同一
+//     （租户,规则,实体,时间窗）至多一条；调用方处置告警只应看这个视图。
+//   - Get/ListHistory/AuditLog 仍可读到已被取代的旧结论，用于留痕追溯。
+//
 // 审计：成功的状态变更、抑制合并与幂等命中各产生一条不可变 AuditEntry；
 // 被拒绝（越权/跨租户/非法转换）的尝试也记入拒绝审计，可追溯。
 type Store struct {
@@ -88,6 +95,11 @@ func (s *Store) MergeSuppressed(alertID, tenantID string, eventIDs []string, fir
 	if a.TenantID != tenantID {
 		s.recordDeniedLocked(a, Operator{TenantID: tenantID}, "suppress_merge", ErrCrossTenant)
 		return ErrCrossTenant
+	}
+	if a.Superseded {
+		// 旧结论已被更正取代，不能再被在线抑制命中改写。
+		s.recordDeniedLocked(a, Operator{TenantID: tenantID}, "suppress_merge", ErrAlertSuperseded)
+		return ErrAlertSuperseded
 	}
 	exist := map[string]bool{}
 	for _, id := range a.EventIDs {
@@ -217,16 +229,34 @@ func (s *Store) Get(id string, op Operator) (*Alert, error) {
 	return &out, nil
 }
 
-// List 按租户列出告警（按创建事件时间排序）。
+// List 按租户列出"当前有效的最终结论"（未被回补更正取代的活跃告警）。
+// 已被取代的旧结论保留留痕但不在此视图中；需要查旧结论用 Get / ListHistory。
+// 结果按创建事件时间排序。
 func (s *Store) List(tenantID string) []*Alert {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.listLocked(tenantID, false)
+}
+
+// ListHistory 按租户列出全部告警记录，含已被更正取代的旧结论（留痕视图）。
+// 结果按创建事件时间排序。
+func (s *Store) ListHistory(tenantID string) []*Alert {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listLocked(tenantID, true)
+}
+
+func (s *Store) listLocked(tenantID string, includeSuperseded bool) []*Alert {
 	var out []*Alert
 	for _, a := range s.alerts {
-		if a.TenantID == tenantID {
-			cp := *a
-			out = append(out, &cp)
+		if a.TenantID != tenantID {
+			continue
 		}
+		if !includeSuperseded && a.Superseded {
+			continue
+		}
+		cp := *a
+		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
@@ -234,6 +264,19 @@ func (s *Store) List(tenantID string) []*Alert {
 		}
 		return out[i].ID < out[j].ID
 	})
+	return out
+}
+
+// AllAlertsForResolve 返回存储内全部告警快照（含已被取代的旧结论、跨租户），
+// 仅供引擎在回补重放时把基线决策映射回真实告警 ID，不是面向调用方的查询视图。
+func (s *Store) AllAlertsForResolve() []*Alert {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*Alert
+	for _, a := range s.alerts {
+		cp := *a
+		out = append(out, &cp)
+	}
 	return out
 }
 

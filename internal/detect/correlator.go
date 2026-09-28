@@ -3,6 +3,7 @@ package detect
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,9 +26,10 @@ import (
 //     抑制期随每次命中顺延（滚动抑制）。抑制状态跨规则版本连续存续。
 
 type stateKey struct {
-	ruleID string
-	ver    int
-	entity string
+	tenantID string
+	ruleID   string
+	ver      int
+	entity   string
 }
 
 type keyState struct {
@@ -39,7 +41,15 @@ type keyState struct {
 type suppressState struct {
 	fireID   string
 	until    time.Time
-	alertKey string
+	alertKey alertKeyID
+}
+
+// alertKeyID 是抑制/新发计数的全局键：必须带租户，避免不同租户下同
+// （规则ID,实体名）互相串抑制、串 FireID 序号。
+type alertKeyID struct {
+	tenant string
+	ruleID string
+	entity string
 }
 
 // Correlator 是有状态关联检测器。
@@ -47,8 +57,8 @@ type Correlator struct {
 	mu        sync.Mutex
 	rules     *RuleSet
 	states    map[stateKey]*keyState
-	suppress  map[string]*suppressState // AlertKey -> 当前抑制期
-	fireCount map[string]int            // AlertKey -> 已产生新告警次数（确定性 FireID 序号）
+	suppress  map[alertKeyID]*suppressState // 抑制期（租户隔离）
+	fireCount map[alertKeyID]int            // 已产生新告警次数（确定性 FireID 序号）
 	watermark time.Time
 }
 
@@ -57,8 +67,8 @@ func NewCorrelator(rules *RuleSet) *Correlator {
 	return &Correlator{
 		rules:     rules,
 		states:    map[stateKey]*keyState{},
-		suppress:  map[string]*suppressState{},
-		fireCount: map[string]int{},
+		suppress:  map[alertKeyID]*suppressState{},
+		fireCount: map[alertKeyID]int{},
 	}
 }
 
@@ -68,7 +78,7 @@ func (c *Correlator) Observe(e *event.Event) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, r := range c.rules.RulesFor(e.TenantID, e.Type, e.EventTime) {
-		k := stateKey{r.ID, r.Version, e.Entity}
+		k := stateKey{tenantID: e.TenantID, ruleID: r.ID, ver: r.Version, entity: e.Entity}
 		st, ok := c.states[k]
 		if !ok {
 			st = &keyState{tenantID: e.TenantID, rule: r}
@@ -137,10 +147,11 @@ func (c *Correlator) evalKey(k stateKey, st *keyState) []Decision {
 			ids[n] = e.ID
 		}
 
-		alertKey := r.ID + "|" + k.entity
+		alertKey := alertKeyID{tenant: st.tenantID, ruleID: r.ID, entity: k.entity}
+		keyStr := r.ID + "|" + k.entity // 面向解释/日志的 AlertKey（租户内唯一）
 		d := Decision{
 			RuleID: r.ID, RuleVersion: r.Version, TenantID: st.tenantID,
-			Entity: k.entity, AlertKey: alertKey, FireAt: t,
+			Entity: k.entity, AlertKey: keyStr, FireAt: t,
 			FirstEventAt: merged[0].EventTime, EventIDs: ids,
 		}
 
@@ -155,7 +166,7 @@ func (c *Correlator) evalKey(k stateKey, st *keyState) []Decision {
 				sup.until.Format(time.RFC3339Nano), sup.fireID, len(ids))
 			sup.until = t.Add(r.SuppressFor) // 滚动抑制：命中即顺延
 		} else {
-			fireID := c.newFireID(r, k.entity, d.FirstEventAt)
+			fireID := c.newFireID(alertKey, r, k.entity, d.FirstEventAt)
 			d.FireID = fireID
 			d.IsAlert = true
 			d.Reason = fmt.Sprintf(
@@ -187,20 +198,24 @@ func (c *Correlator) evalKey(k stateKey, st *keyState) []Decision {
 	return out
 }
 
-// newFireID 生成确定性的 FireID：只依赖规则、实体、首次事件时间与该键第几次
-// 新发告警，与 map 遍历顺序、墙钟无关，保证同一事件/规则集合下 ID 可复现。
-func (c *Correlator) newFireID(r Rule, entity string, firstEventAt time.Time) string {
-	key := r.ID + "|" + entity
+// newFireID 生成确定性的、全局唯一的 FireID：依赖租户、规则、实体、首次事件
+// 时间与该键第几次新发告警，与 map 遍历顺序、墙钟无关，保证同一事件/规则集合
+// 下 ID 可复现，且不同租户不会撞 ID。
+func (c *Correlator) newFireID(key alertKeyID, r Rule, entity string, firstEventAt time.Time) string {
 	c.fireCount[key]++
-	return fmt.Sprintf("fire:%s:%s:%d:%d",
-		r.ID, entity, firstEventAt.UnixNano(), c.fireCount[key])
+	return fmt.Sprintf("fire:%s:%s:%s:%d:%d",
+		key.tenant, r.ID, entity, firstEventAt.UnixNano(), c.fireCount[key])
 }
 
-// SuppressionView 返回某 AlertKey 当前抑制期（测试与解释用）。
-func (c *Correlator) SuppressionView(alertKey string) (fireID string, until time.Time, ok bool) {
+// SuppressionView 返回某租户内 AlertKey（"规则ID|实体"）当前抑制期（测试与解释用）。
+func (c *Correlator) SuppressionView(tenantID, alertKey string) (fireID string, until time.Time, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	s := c.suppress[alertKey]
+	parts := strings.SplitN(alertKey, "|", 2)
+	if len(parts) != 2 {
+		return "", time.Time{}, false
+	}
+	s := c.suppress[alertKeyID{tenant: tenantID, ruleID: parts[0], entity: parts[1]}]
 	if s == nil {
 		return "", time.Time{}, false
 	}

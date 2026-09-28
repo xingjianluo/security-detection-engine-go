@@ -172,6 +172,47 @@ func main() {
 	for _, q := range eng.Quarantine() {
 		fmt.Printf("  %-9s reason=%-20s %s\n", q.Disposition, q.Reason, q.Detail)
 	}
+
+	fmt.Println("\n---- 9) 受控回补：迟到 L1(t+30s) 补入后重算 alice 窗口，结论更正 ----")
+	ops := op("ops-1", "tenant-a", alert.RoleOperator)
+	bf := eng.Backfill(engine.BackfillRequest{
+		RequestID: "demo-backfill-1", TenantID: "tenant-a", Operator: ops,
+		Start: base, End: base.Add(2 * time.Minute), Reason: "上游补发 L1",
+	})
+	fmt.Printf("  回补结果=%s 补入事件=%v 更正数=%d\n", bf.Status, bf.ReplayedEvents, len(bf.Corrections))
+	for _, c := range bf.Corrections {
+		fmt.Printf("  更正记录 %s kind=%s 旧结论=%v 新结论=%s\n    补入事件=%v 基线事件=%v 最终事件=%v\n",
+			c.ID, c.Kind, c.OriginalAlertIDs, c.CorrectedAlertID,
+			c.AddedEventIDs, c.BaselineEventIDs, c.FinalEventIDs)
+	}
+	fmt.Println("  正常查询 store.List（只看当前有效最终结论）：")
+	for _, a := range store.List("tenant-a") {
+		tag := ""
+		if a.IsCorrection {
+			tag = " [更正结论]"
+		}
+		fmt.Printf("    %s entity=%s status=%s%s\n", a.ID, a.Entity, a.Status, tag)
+	}
+	fmt.Println("  留痕查询 store.ListHistory（含已被取代的旧结论）：")
+	for _, a := range store.ListHistory("tenant-a") {
+		switch {
+		case a.Superseded:
+			fmt.Printf("    %s entity=%s status=%s superseded_by=%s（可追溯，不可再处置）\n",
+				a.ID, a.Entity, a.Status, a.SupersededBy)
+		case a.IsCorrection:
+			fmt.Printf("    %s entity=%s status=%s correction=%s supersedes=%v（当前有效）\n",
+				a.ID, a.Entity, a.Status, a.CorrectionID, a.Supersedes)
+		default:
+			fmt.Printf("    %s entity=%s status=%s（当前有效）\n", a.ID, a.Entity, a.Status)
+		}
+	}
+	// 同一请求重复发起：幂等，不新增结论/更正。
+	again := eng.Backfill(engine.BackfillRequest{
+		RequestID: "demo-backfill-1", TenantID: "tenant-a", Operator: ops,
+		Start: base, End: base.Add(2 * time.Minute)})
+	fmt.Printf("  同一 RequestID 再发起 -> %s（结论数仍为 %d，更正数仍为 %d）\n",
+		again.Status, len(store.List("tenant-a")), len(store.ListCorrections("tenant-a")))
+
 	fmt.Println("\n演示结束。")
 }
 

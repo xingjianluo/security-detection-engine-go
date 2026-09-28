@@ -15,6 +15,9 @@ var (
 	ErrCorrectionNotFound = errors.New("correction not found")
 	// ErrAlertSuperseded 告警已被一次更正取代，不能再作为最终结论变更。
 	ErrAlertSuperseded = errors.New("alert superseded by a correction")
+	// ErrCorrectionConflict 同一（规则,实体,时间窗）已存在另一条当前有效结论，
+	// 不能再登记一条并列的更正，避免一个窗口出现两条最终版。
+	ErrCorrectionConflict = errors.New("correction conflicts with existing effective alert for the same window")
 )
 
 // CorrectionKind 描述更正的类型。
@@ -51,6 +54,7 @@ type Correction struct {
 }
 
 // supersedeLocked 标记一条既有告警被更正取代并写审计。调用方持锁。
+// 旧告警进入 StatusSuperseded 终态：列表不再可见、不可再处置，但记录留痕。
 func (s *Store) supersedeLocked(alertID, correctionID, reason string) error {
 	a, ok := s.alerts[alertID]
 	if !ok {
@@ -63,12 +67,14 @@ func (s *Store) supersedeLocked(alertID, correctionID, reason string) error {
 	if a.Superseded {
 		return nil // 幂等：已被同一更正取代
 	}
+	from := a.Status
 	a.Superseded = true
+	a.Status = StatusSuperseded
 	a.SupersededBy = correctionID
 	a.UpdatedAt = s.clock().UTC()
 	s.appendAuditLocked(AuditEntry{
 		AlertID: alertID, TenantID: a.TenantID, Action: "supersede",
-		FromState: a.Status, ToState: a.Status, At: s.clock().UTC(),
+		FromState: from, ToState: StatusSuperseded, At: s.clock().UTC(),
 		Reason: "superseded by correction " + correctionID + ": " + reason,
 	})
 	return nil
@@ -107,6 +113,8 @@ func (s *Store) registerCorrectionLocked(corr Correction) *Correction {
 
 // CreateCorrected 基于重算结论创建一条"更正告警"，并登记其 Correction 记录。
 // 同 correctionID 重复调用按幂等处理，返回既有结论。
+// 不变量：同一（租户,规则,实体,窗口右端 FireAt）至多一条当前有效结论；
+// 若该窗口已存在另一条未被取代的告警，返回 ErrCorrectionConflict（不产生任何改动）。
 func (s *Store) CreateCorrected(corr Correction, a Alert) (*Alert, *Correction, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -121,7 +129,19 @@ func (s *Store) CreateCorrected(corr Correction, a Alert) (*Alert, *Correction, 
 		return nil, got, nil
 	}
 
-	// 先取代原结论（changed/added 都可能带来新告警；added 没有原告警）。
+	// 先校验：目标窗口不能已有另一条当前有效结论（防止同一窗口两条更正并存）。
+	// 本次更正自己要取代的原告警除外（它们随后立即进入 superseded）。
+	replacing := map[string]bool{}
+	for _, oid := range corr.OriginalAlertIDs {
+		replacing[oid] = true
+	}
+	for _, ex := range s.alerts {
+		if ex.TenantID == a.TenantID && ex.RuleID == a.RuleID && ex.Entity == a.Entity &&
+			ex.FireAt.Equal(a.FireAt) && !ex.Superseded && !replacing[ex.ID] {
+			return nil, nil, ErrCorrectionConflict
+		}
+	}
+	// 取代原结论（changed 有原告警；added 没有）。校验先于变更，避免半更新。
 	for _, oid := range corr.OriginalAlertIDs {
 		if err := s.supersedeLocked(oid, corr.ID, corr.Reason); err != nil {
 			return nil, nil, err
@@ -130,6 +150,7 @@ func (s *Store) CreateCorrected(corr Correction, a Alert) (*Alert, *Correction, 
 
 	a.IsCorrection = true
 	a.CorrectionID = corr.ID
+	a.Supersedes = append([]string{}, corr.OriginalAlertIDs...)
 	a.Status = StatusOpen
 	now := s.clock().UTC()
 	a.CreatedAt = a.CreatedAt.UTC()
@@ -167,7 +188,11 @@ func (s *Store) RegisterWithdrawal(corr Correction) (*Correction, error) {
 	if got, ok := s.corrections[corr.ID]; ok { // 幂等
 		return got, nil
 	}
+	prior := map[string]Status{}
 	for _, oid := range corr.OriginalAlertIDs {
+		if a, ok := s.alerts[oid]; ok {
+			prior[oid] = a.Status
+		}
 		if err := s.supersedeLocked(oid, corr.ID, corr.Reason); err != nil {
 			return nil, err
 		}
@@ -178,7 +203,7 @@ func (s *Store) RegisterWithdrawal(corr Correction) (*Correction, error) {
 	for _, oid := range corr.OriginalAlertIDs {
 		s.appendAuditLocked(AuditEntry{
 			AlertID: oid, TenantID: corr.TenantID, Action: "withdraw_correction",
-			FromState: StatusOpen, ToState: StatusOpen, At: s.clock().UTC(),
+			FromState: prior[oid], ToState: StatusSuperseded, At: s.clock().UTC(),
 			Reason: "conclusion withdrawn by backfill request " + corr.RequestID +
 				": " + corr.Reason,
 		})

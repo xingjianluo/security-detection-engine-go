@@ -177,3 +177,50 @@ func TestCorrelatorEntityAndTenant(t *testing.T) {
 		t.Fatalf("want one alert per entity, got %+v", d)
 	}
 }
+
+// 回归：两个租户注册相同 ID/版本的规则、且事件实体同名时，累计窗口、抑制期与
+// FireID 序号必须完全按租户隔离——各租户独立成警，事件不跨租户合并，ID 不撞。
+func TestCorrelatorSameRuleIDAcrossTenants(t *testing.T) {
+	base := time.Date(2026, 9, 24, 10, 0, 0, 0, time.UTC)
+	rs := NewRuleSet()
+	for _, tenant := range []string{"t1", "t2"} {
+		_ = rs.Put(Rule{ID: "r", TenantID: tenant, Version: 1, EventType: "x",
+			Window: time.Minute, Threshold: 2, SuppressFor: time.Minute, EffectiveAt: base.Add(-time.Hour)})
+	}
+	c := NewCorrelator(rs)
+	d := feed(t, c, []*event.Event{
+		ev("t1", "a1", "alice", "x", base),
+		ev("t2", "b1", "alice", "x", base),
+		ev("t1", "a2", "alice", "x", base.Add(time.Second)),
+		ev("t2", "b2", "alice", "x", base.Add(time.Second)),
+	}, base.Add(time.Second), "same-rule-across-tenants")
+	if len(d) != 2 {
+		t.Fatalf("each tenant must fire once independently, got %+v", d)
+	}
+	byTenant := map[string]Decision{}
+	for _, dec := range d {
+		if !dec.IsAlert {
+			t.Fatalf("cross-tenant suppression leak: %+v", dec)
+		}
+		if len(dec.EventIDs) != 2 {
+			t.Fatalf("events merged across tenants: %v", dec.EventIDs)
+		}
+		byTenant[dec.TenantID] = dec
+	}
+	if byTenant["t1"].FireID == byTenant["t2"].FireID {
+		t.Fatalf("FireID must be unique across tenants: %s", byTenant["t1"].FireID)
+	}
+	if _, ok := byTenant["t1"]; !ok || byTenant["t1"].EventIDs[0] != "a1" {
+		t.Fatalf("t1 decision wrong: %+v", byTenant["t1"])
+	}
+	if _, ok := byTenant["t2"]; !ok || byTenant["t2"].EventIDs[0] != "b1" {
+		t.Fatalf("t2 decision wrong: %+v", byTenant["t2"])
+	}
+	// 抑制期也按租户隔离：同名 AlertKey 在各自租户独立查询。
+	if f1, _, ok := c.SuppressionView("t1", "r|alice"); !ok || f1 != byTenant["t1"].FireID {
+		t.Fatal("t1 suppression view wrong")
+	}
+	if f2, _, ok := c.SuppressionView("t2", "r|alice"); !ok || f2 != byTenant["t2"].FireID {
+		t.Fatal("t2 suppression view wrong")
+	}
+}
