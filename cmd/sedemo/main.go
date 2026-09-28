@@ -73,6 +73,11 @@ func main() {
 		fmt.Printf("  %-28s -> %-9s %s %s\n", b.tag, r.Disposition, r.Reason, r.Detail)
 	}
 
+	// 在任何水位断言之前，先在独立租户上完整演示受控回补（保证基线事件正常受理、
+	// 随后迟到补入的事件能真实地"改变历史窗口结论"）。
+	fmt.Println("\n---- 1.5) 受控回补（独立租户）：迟到事件改变历史窗口结论 ----")
+	demoBackfill(eng, store, base, jsonRec)
+
 	fmt.Println("\n---- 2) 断言水位 watermark = time_base + 2m，窗口定论 ----")
 	fired := eng.Advance(base.Add(2 * time.Minute))
 	for _, id := range fired {
@@ -172,7 +177,79 @@ func main() {
 	for _, q := range eng.Quarantine() {
 		fmt.Printf("  %-9s reason=%-20s %s\n", q.Disposition, q.Reason, q.Detail)
 	}
+
 	fmt.Println("\n演示结束。")
+}
+
+// demoBackfill 在一个独立租户上演示回补更正的完整语义：
+// 同一时间窗更正后正常查询只有一条当前结论；旧结论进入 superseded 终态但可追溯；
+// 重叠/重复回补被拒绝或幂等返回；跨租户与越权请求被拒且不影响既有结论。
+func demoBackfill(eng *engine.Engine, store *alert.Store, base time.Time,
+	jsonRec func(id, who string, offset time.Duration) string) {
+	tenant := "tenant-bf"
+	must(eng.Rules().Put(detect.Rule{ID: "brute-force", TenantID: tenant, Version: 1,
+		EventType: "login_fail", Window: time.Minute, Threshold: 3,
+		SuppressFor: time.Hour, EffectiveAt: base.Add(-time.Hour)}))
+	op := alert.Operator{ID: "ops-bf", TenantID: tenant, Role: alert.RoleOperator}
+	ing := func(id string, off time.Duration) {
+		r := eng.Ingest(tenant, event.SourceJSON, jsonRec(id, "dave", off))
+		fmt.Printf("  ingest %-3s t+%-4v -> %s\n", id, off, r.Disposition)
+	}
+	ing("f1", 0)
+	ing("f2", 20*time.Second)
+	ing("f3", 40*time.Second)
+	eng.Advance(base.Add(10 * time.Minute))
+	listIDs := func() []string {
+		var ids []string
+		for _, a := range store.List(tenant) {
+			ids = append(ids, a.ID)
+		}
+		return ids
+	}
+	old := listIDs()
+	fmt.Println("  回补前正常查询:", old)
+
+	// 迟到的 f0@t+10s 改变窗口结论（穿越点从 t+40 位移到 t+20）。
+	ing("f0-late", 10*time.Second)
+	res := eng.Backfill(engine.BackfillRequest{
+		RequestID: "bf-1", TenantID: tenant, Operator: op,
+		Start: base.Add(-time.Minute), End: base.Add(10 * time.Minute),
+		Reason: "upstream re-delivered dropped shard",
+	})
+	fmt.Printf("  回补结果: status=%s\n", res.Status)
+	for _, c := range res.Corrections {
+		fmt.Printf("    更正 %s kind=%s 窗口右端=t+%v\n", c.ID, c.Kind, c.WindowEnd.Sub(base))
+		fmt.Printf("      旧结论=%v 新结论=%s\n", c.OriginalAlertIDs, c.CorrectedAlertID)
+		fmt.Printf("      基线事件=%v 最终事件=%v 补入事件=%v\n",
+			c.BaselineEventIDs, c.FinalEventIDs, c.AddedEventIDs)
+	}
+	fmt.Println("  回补后正常查询（只剩一条当前结论）:", listIDs())
+	for _, a := range store.ListHistory(tenant) {
+		fmt.Printf("    历史留痕 %s status=%-10s supersededBy=%s events=%v\n",
+			a.ID, a.Status, a.SupersededBy, a.EventIDs)
+	}
+	if len(old) > 0 {
+		if _, err := store.Ack(old[0], op, "try to act on old conclusion"); err != nil {
+			fmt.Printf("  对旧结论做处置被明确拒绝: %v\n", err)
+		}
+	}
+
+	// 同一 RequestID 重放 => 幂等。
+	again := eng.Backfill(engine.BackfillRequest{RequestID: "bf-1", TenantID: tenant,
+		Operator: op, Start: base.Add(-time.Minute), End: base.Add(10 * time.Minute)})
+	fmt.Printf("  同 RequestID 重放: status=%s（不重复产出更正）\n", again.Status)
+
+	// 不同 RequestID 再碰同一窗口 => 整批拒绝。
+	overlap := eng.Backfill(engine.BackfillRequest{RequestID: "bf-2", TenantID: tenant,
+		Operator: op, Start: base.Add(-time.Minute), End: base.Add(10 * time.Minute)})
+	fmt.Printf("  重叠回补同一窗口: status=%s reject=%v\n", overlap.Status, overlap.Reject)
+
+	// 跨租户 / viewer 越权被拒。
+	cross := eng.Backfill(engine.BackfillRequest{RequestID: "bf-x", TenantID: tenant,
+		Operator: alert.Operator{ID: "x", TenantID: "other", Role: alert.RoleAdmin},
+		Start:    base.Add(-time.Minute), End: base.Add(10 * time.Minute)})
+	fmt.Printf("  跨租户回补: status=%s reject=%v\n", cross.Status, cross.Reject)
+	fmt.Println("  被拒绝尝试已写入全量审计链（DeniedAttempts 可见）。")
 }
 
 func must(err error) {

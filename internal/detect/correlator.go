@@ -206,3 +206,31 @@ func (c *Correlator) SuppressionView(alertKey string) (fireID string, until time
 	}
 	return s.fireID, s.until, true
 }
+
+// RetargetSuppression 把在线抑制状态中指向 oldFireID 的抑制期改挂到 newFireID。
+// 用于回补更正（changed）：后续抑制命中应合并到更正后的当前可见告警，
+// 而不是已经 superseded 的旧结论。返回是否发生了重挂。
+func (c *Correlator) RetargetSuppression(oldFireID, newFireID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, st := range c.suppress {
+		if st.fireID == oldFireID {
+			c.suppress[key] = &suppressState{
+				fireID: newFireID, until: st.until, alertKey: st.alertKey,
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// ClearSuppressionIf 若某 AlertKey 的在线抑制期当前指向 fireID，则清除它。
+// 用于回补撤回（withdrawn）：旧窗口结论不再成立，后续阈值穿越应产生新告警，
+// 而不是作为抑制命中挂到一个已消失的旧 FireID 上。
+func (c *Correlator) ClearSuppressionIf(alertKey, fireID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if st := c.suppress[alertKey]; st != nil && st.fireID == fireID {
+		delete(c.suppress, alertKey)
+	}
+}

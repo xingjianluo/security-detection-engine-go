@@ -51,6 +51,9 @@ var (
 	ErrBackfillBeyondWatermark = fmt.Errorf("backfill: end beyond settled watermark")
 	// ErrBackfillNoRequestID 缺少幂等键。
 	ErrBackfillNoRequestID = fmt.Errorf("backfill: request id required")
+	// ErrBackfillWindowCorrected 范围内某个时间窗已有生效中的更正，
+	// 同一窗口不允许第二条更正结论（拒绝整次请求，避免部分生效）。
+	ErrBackfillWindowCorrected = fmt.Errorf("backfill: window already corrected")
 )
 
 // BackfillRequest 是一次受控回补请求。
@@ -76,12 +79,12 @@ type RawRecord struct {
 
 // BackfillResult 是回补请求的明确结果。
 type BackfillResult struct {
-	Status       BackfillStatus
-	Request      BackfillRequest
-	Reject       error                // Status==rejected 时非空（可区分原因）
-	Corrections  []alert.Correction   // applied 时本次产生的更正
+	Status         BackfillStatus
+	Request        BackfillRequest
+	Reject         error              // Status==rejected 时非空（可区分原因）
+	Corrections    []alert.Correction // applied 时本次产生的更正
 	ReplayedEvents []string           // 本次实际纳入重算的补入事件 ID（去重后）
-	SkippedExtra []SkippedRecord      // 补投记录中无法解析/越界被跳过的条目
+	SkippedExtra   []SkippedRecord    // 补投记录中无法解析/越界被跳过的条目
 }
 
 // SkippedRecord 描述回补补投记录中被跳过的一条。
@@ -101,6 +104,39 @@ type replayGroup struct {
 }
 
 func groupKey(d detect.Decision) string { return d.RuleID + "|" + d.Entity }
+
+// foldSuppressed 把关联器输出中的抑制命中折叠进其所属的主告警结论：
+// 同一 AlertKey 的判定按 FireAt 有序，抑制命中（IsAlert=false, SuppressedBy 非空）
+// 携带的事件 ID 合并到当前主告警。折叠后每个输出都代表该窗口的一条完整结论
+// （主告警 + 其全部抑制命中），使基线/重算的"结论"可按合并事件集合精确比对。
+func foldSuppressed(ds []detect.Decision) []detect.Decision {
+	var out []detect.Decision
+	idx := map[string]int{} // FireID -> out 下标
+	for _, d := range ds {
+		if d.IsAlert {
+			idx[d.FireID] = len(out)
+			out = append(out, d)
+			continue
+		}
+		// 抑制命中：优先归并到重放流中对应的主告警。
+		if pos, ok := idx[d.SuppressedBy]; ok {
+			out[pos].EventIDs = append(out[pos].EventIDs, d.EventIDs...)
+			continue
+		}
+		// 兜底：主告警不在本次输出（理论上不会发生，防御性保留为独立条目）。
+		out = append(out, d)
+	}
+	for i := range out {
+		sort.Strings(out[i].EventIDs)
+	}
+	return out
+}
+
+// corrPlan 是一个窗口的待应用更正（先计算、后统一应用，保证整次回补原子生效）。
+type corrPlan struct {
+	corr      alert.Correction
+	corrected *alert.Alert // withdrawn 时为 nil
+}
 
 // Backfill 发起一次受控回补。并发安全：与在线 Ingest/Advance/Tick 串行化。
 func (e *Engine) Backfill(req BackfillRequest) BackfillResult {
@@ -123,35 +159,98 @@ func (e *Engine) Backfill(req BackfillRequest) BackfillResult {
 	//    以及请求中显式补投、通过解析且未在事件日志中的记录。
 	added, skipped := e.collectBackfillEventsLocked(req)
 
+	// 1.5) 范围预检：区间内若已有任何"定案更正"的窗口，整次请求拒绝。
+	// 这样即使补入事件已被先到的回补并入基线（重算结果与现状一致、没有 diff），
+	// 调用方仍能得到明确的"该窗口已更正、不能再改"信号，而不是一个看似成功的空操作。
+	if rej := e.checkCorrectedWindowsLocked(req); rej != nil {
+		e.alerts.RecordDeniedBackfill(req.TenantID, req.Operator, rej.Error())
+		return BackfillResult{Status: BackfillRejected, Request: req, Reject: rej,
+			SkippedExtra: skipped}
+	}
+
 	// 2) 基线：重放事件日志（不含补入），得到 [Start,End] 内的既有判定。
-	baseDec := e.replayLocked(req.TenantID, req.End, nil)
+	baseDec := foldSuppressed(e.replayLocked(req.TenantID, req.End, nil))
 	// 3) 重算：在事件日志之上叠加补入事件重放。
-	replDec := e.replayLocked(req.TenantID, req.End, added)
+	replDec := foldSuppressed(e.replayLocked(req.TenantID, req.End, added))
 
 	// 4) 按 (规则,实体) 分组并只保留穿越点落在区间内的判定。
 	groups := alignGroups(baseDec, replDec, req.Start, req.End)
 
-	// 5) 逐组比对，只在结论确实不同的窗口产出更正；相同则零噪音。
+	// 5) 逐组逐窗口比对，先算出全部待应用更正计划（不触碰任何状态）。
+	addedSet := addedIDs(added)
+	var plans []corrPlan
+	for _, g := range groups {
+		ps, err := e.planGroupLocked(g, req, addedSet)
+		if err != nil {
+			// 窗口已被别的回补更正等：整次请求拒绝，绝不部分生效，
+			// 其它租户/其它时间段的既有结论不受影响。
+			e.alerts.RecordDeniedBackfill(req.TenantID, req.Operator, err.Error())
+			return BackfillResult{Status: BackfillRejected, Request: req, Reject: err,
+				SkippedExtra: skipped}
+		}
+		plans = append(plans, ps...)
+	}
+
 	res := &BackfillResult{
 		Status:         BackfillNoChange,
 		Request:        req,
 		ReplayedEvents: eventIDsOf(added),
 		SkippedExtra:   skipped,
 	}
-	for _, g := range groups {
-		if corr, changed := e.diffGroupLocked(g, req, addedIDs(added)); changed {
-			res.Corrections = append(res.Corrections, *corr)
-		}
+
+	// 6) 统一应用：每条更正只对应一个窗口；整批在存储的单个临界区内原子生效，
+	//    任一窗口冲突则整批回滚，绝不留下"部分窗口已更正"的中间状态。
+	type applyItem = struct {
+		Corr      alert.Correction
+		Corrected *alert.Alert
 	}
-	if len(res.Corrections) > 0 {
+	items := make([]applyItem, 0, len(plans))
+	for _, p := range plans {
+		items = append(items, applyItem{Corr: p.corr, Corrected: p.corrected})
+	}
+	newAlerts, gotCorrs, err := e.alerts.ApplyCorrections(items)
+	if err != nil {
+		e.alerts.RecordDeniedBackfill(req.TenantID, req.Operator, err.Error())
+		return BackfillResult{Status: BackfillRejected, Request: req, Reject: err,
+			SkippedExtra: skipped}
+	}
+	// 全部更正生效后再同步在线抑制状态，保证后续在线命中写到当前可见结论。
+	var applied []alert.Correction
+	for i, got := range gotCorrs {
+		e.retargetSuppressionLocked(got, newAlerts[i])
+		applied = append(applied, *got)
+	}
+	res.Corrections = applied
+	if len(applied) > 0 {
 		res.Status = BackfillApplied
 	}
 
-	// 6) 认领补入事件，登记幂等台账；无论结论是否改变，补入都只生效一次。
+	// 7) 认领补入事件，登记幂等台账；无论结论是否改变，补入都只生效一次。
 	e.claimBackfillEventsLocked(req, added)
 	stored := *res
 	e.backfills[req.RequestID] = &stored
 	return *res
+}
+
+// retargetSuppressionLocked 在更正生效后同步在线关联器的抑制状态。
+// 调用方持引擎锁。
+func (e *Engine) retargetSuppressionLocked(corr *alert.Correction, newAlert *alert.Alert) {
+	switch corr.Kind {
+	case alert.CorrectionWithdrawn:
+		// 撤回：清掉指向任一旧结论的抑制期，使后续穿越产生新告警。
+		for _, oid := range corr.OriginalAlertIDs {
+			e.corr.ClearSuppressionIf(corr.RuleID+"|"+corr.Entity, oid)
+		}
+	default:
+		// changed/added：把指向旧结论的抑制期改挂到更正告警。
+		if newAlert != nil {
+			for _, oid := range corr.OriginalAlertIDs {
+				if e.corr.RetargetSuppression(oid, newAlert.ID) {
+					return
+				}
+			}
+		}
+	}
 }
 
 // validateBackfillLocked 校验请求；调用方持锁。
@@ -175,6 +274,31 @@ func (e *Engine) validateBackfillLocked(req BackfillRequest) error {
 	if wm.IsZero() || req.End.After(wm) {
 		// 只允许回补已定论（水位已越过）的历史，避免与在线未决窗口冲突。
 		return ErrBackfillBeyondWatermark
+	}
+	return nil
+}
+
+// checkCorrectedWindowsLocked 判断请求区间是否与任何已定案更正的窗口重叠。
+// 窗口锚点是原结论穿越点；changed 时补入事件可能让穿越点发生位移，因此同时
+// 参考更正后告警的穿越点——只要其中一个落在 [Start,End] 内，本次回补就触及
+// 已更正窗口，必须整批拒绝（同一窗口不允许第二条更正）。
+// 调用方持引擎锁。
+func (e *Engine) checkCorrectedWindowsLocked(req BackfillRequest) error {
+	for _, c := range e.alerts.ListCorrections(req.TenantID) {
+		inRange := func(t time.Time) bool {
+			return !t.Before(req.Start) && !t.After(req.End)
+		}
+		if inRange(c.WindowEnd.UTC()) {
+			return ErrBackfillWindowCorrected
+		}
+		if c.CorrectedAlertID != "" {
+			op := req.Operator
+			if a, err := e.alerts.Get(c.CorrectedAlertID, op); err == nil {
+				if inRange(a.FireAt.UTC()) {
+					return ErrBackfillWindowCorrected
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -318,15 +442,18 @@ func alignGroups(base, repl []detect.Decision, start, end time.Time) []replayGro
 	return out
 }
 
-// diffGroupLocked 比对一个 (规则,实体) 组在区间内的基线与重算判定。
+// planGroupLocked 比对一个 (规则,实体) 组在区间内的基线与重算窗口结论，
+// 为【每一个结论不同的窗口】生成一条独立更正计划（一条 Correction 严格对应
+// 一个窗口身份，保证同窗口最终可见结论唯一）。
+//
 // 两阶段对齐：
 //  1. 合并事件集合完全相同的窗口 => 同一窗口，结论不变；
-//  2. 剩余未配对窗口按穿越点有序两两交叉配对 => 同一窗口结论变化（changed）；
+//  2. 剩余未配对窗口按穿越点有序两两交叉配对 => 该窗口结论变化（changed）；
 //     多出来的基线窗口 => 结论撤回（withdrawn）；多出来的重算窗口 => 新增（added）。
 //
 // 这样单纯"第几次新发"的序号漂移不会造成噪音；只有窗口事件集合真正不同才更正。
-// 调用方持锁。
-func (e *Engine) diffGroupLocked(g replayGroup, req BackfillRequest, added map[string]bool) (*alert.Correction, bool) {
+// 调用方持引擎锁；本函数不产生任何副作用。
+func (e *Engine) planGroupLocked(g replayGroup, req BackfillRequest, added map[string]bool) ([]corrPlan, error) {
 	baseUsed := make([]bool, len(g.base))
 	replUsed := make([]bool, len(g.repl))
 
@@ -355,58 +482,94 @@ func (e *Engine) diffGroupLocked(g replayGroup, req BackfillRequest, added map[s
 			replLeft = append(replLeft, rj)
 		}
 	}
-	// 两侧均按 FireAt 升序（关联器输出已排序）。
 	sort.Slice(baseLeft, func(i, j int) bool { return g.base[baseLeft[i]].FireAt.Before(g.base[baseLeft[j]].FireAt) })
 	sort.Slice(replLeft, func(i, j int) bool { return g.repl[replLeft[i]].FireAt.Before(g.repl[replLeft[j]].FireAt) })
 	if len(baseLeft) == 0 && len(replLeft) == 0 {
-		return nil, false // 全部窗口一致：结论不变，零噪音
+		return nil, nil // 全部窗口一致：结论不变，零噪音
 	}
 
-	corr := alert.Correction{
-		RequestID: req.RequestID, TenantID: g.tenantID, RuleID: g.ruleID,
-		Entity: g.entity, OperatorID: req.Operator.ID,
-	}
-	var origIDs []string
-	windowStart, windowEnd := time.Time{}, time.Time{}
-	markWindow := func(start, end time.Time) {
-		if windowStart.IsZero() || start.Before(windowStart) {
-			windowStart = start
-		}
-		if end.After(windowEnd) {
-			windowEnd = end
-		}
+	ruleVer := 0
+	if len(g.repl) > 0 {
+		ruleVer = g.repl[len(g.repl)-1].RuleVersion
+	} else if len(g.base) > 0 {
+		ruleVer = g.base[len(g.base)-1].RuleVersion
 	}
 
-	// 阶段 2a：交叉配对 => changed（旧窗口结论被新窗口取代）。
+	var plans []corrPlan
+
+	// 阶段 2a：交叉配对 => changed，每个窗口一条更正。
 	n := len(baseLeft)
 	if len(replLeft) < n {
 		n = len(replLeft)
 	}
 	for k := 0; k < n; k++ {
 		bd, rd := g.base[baseLeft[k]], g.repl[replLeft[k]]
-		origIDs = append(origIDs, e.resolveAlertIDLocked(bd))
-		corr.BaselineEventIDs = append(corr.BaselineEventIDs, bd.EventIDs...)
-		corr.FinalEventIDs = append(corr.FinalEventIDs, rd.EventIDs...)
-		markWindow(rd.FirstEventAt, rd.FireAt)
+		plan, err := e.buildPlanLocked(req, g, ruleVer,
+			[]detect.Decision{bd}, []detect.Decision{rd}, added)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, plan)
 	}
-	// 多出来的基线窗口 => withdrawn。
+	// 阶段 2b：多出来的基线窗口 => withdrawn（各自独立更正）。
 	for _, bi := range baseLeft[n:] {
-		bd := g.base[bi]
+		plan, err := e.buildPlanLocked(req, g, ruleVer,
+			[]detect.Decision{g.base[bi]}, nil, added)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, plan)
+	}
+	// 阶段 2c：多出来的重算窗口 => added（各自独立更正）。
+	for _, rj := range replLeft[n:] {
+		plan, err := e.buildPlanLocked(req, g, ruleVer,
+			nil, []detect.Decision{g.repl[rj]}, added)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, plan)
+	}
+	return plans, nil
+}
+
+// buildPlanLocked 为单个窗口构造更正计划。调用方持引擎锁，无副作用。
+func (e *Engine) buildPlanLocked(req BackfillRequest, g replayGroup, ruleVer int,
+	baseDs, replDs []detect.Decision, added map[string]bool) (corrPlan, error) {
+	corr := alert.Correction{
+		RequestID: req.RequestID, TenantID: g.tenantID, RuleID: g.ruleID,
+		RuleVersion: ruleVer, Entity: g.entity, OperatorID: req.Operator.ID,
+	}
+	var origIDs []string
+	// 窗口身份锚定【原结论】的穿越点：补入事件会让重算的穿越点发生位移，
+	// 但它仍是"同一个时间窗的更正"，不能因为右端漂移被当成另一个窗口。
+	windowStart, windowEnd := time.Time{}, time.Time{}
+	for _, bd := range baseDs {
 		origIDs = append(origIDs, e.resolveAlertIDLocked(bd))
 		corr.BaselineEventIDs = append(corr.BaselineEventIDs, bd.EventIDs...)
-		markWindow(bd.FirstEventAt, bd.FireAt)
+		if windowStart.IsZero() || bd.FirstEventAt.Before(windowStart) {
+			windowStart = bd.FirstEventAt
+		}
+		if bd.FireAt.After(windowEnd) {
+			windowEnd = bd.FireAt
+		}
 	}
-	// 多出来的重算窗口 => added。
-	var addedDecs []detect.Decision
-	for _, rj := range replLeft[n:] {
-		rd := g.repl[rj]
+	var rep *detect.Decision
+	for i := range replDs {
+		rd := replDs[i]
 		corr.FinalEventIDs = append(corr.FinalEventIDs, rd.EventIDs...)
-		addedDecs = append(addedDecs, rd)
-		markWindow(rd.FirstEventAt, rd.FireAt)
+		// added（无原结论）时窗口边界由重算结论定义。
+		if windowStart.IsZero() || rd.FirstEventAt.Before(windowStart) {
+			windowStart = rd.FirstEventAt
+		}
+		if windowEnd.IsZero() || rd.FireAt.After(windowEnd) {
+			windowEnd = rd.FireAt
+		}
+		d := rd
+		rep = &d
 	}
 
-	hasBase := len(corr.BaselineEventIDs) > 0
-	hasFinal := len(corr.FinalEventIDs) > 0
+	hasBase := len(baseDs) > 0
+	hasFinal := len(replDs) > 0
 	switch {
 	case hasBase && hasFinal:
 		corr.Kind = alert.CorrectionChanged
@@ -419,11 +582,6 @@ func (e *Engine) diffGroupLocked(g replayGroup, req BackfillRequest, added map[s
 	corr.WindowStart = windowStart
 	corr.WindowEnd = windowEnd
 	corr.AddedEventIDs = intersectAdded(corr.FinalEventIDs, added)
-	if len(g.repl) > 0 {
-		corr.RuleVersion = g.repl[len(g.repl)-1].RuleVersion
-	} else if len(g.base) > 0 {
-		corr.RuleVersion = g.base[len(g.base)-1].RuleVersion
-	}
 	corr.Reason = fmt.Sprintf(
 		"backfill %s re-evaluated tenant=%s rule=%s entity=%s window[%s,%s] (%s): %s; added events=%v",
 		req.RequestID, g.tenantID, g.ruleID, g.entity,
@@ -431,53 +589,45 @@ func (e *Engine) diffGroupLocked(g replayGroup, req BackfillRequest, added map[s
 		corr.Kind, req.Reason, corr.AddedEventIDs)
 	corr.ID = correctionID(req.RequestID, g.ruleID, g.entity, windowEnd)
 
-	// withdrawn：没有替代告警，只登记撤回更正。
-	if corr.Kind == alert.CorrectionWithdrawn {
-		got, err := e.alerts.RegisterWithdrawal(corr)
-		if err != nil {
-			return nil, false
+	// 预检（在统一应用之前，保证多窗口请求要么全过、要么整批拒绝，不留半成品）：
+	// 原结论已经被更正（含原结论本身就是更正告警）的窗口不允许再出现第二条更正；
+	// 同窗口身份的另一条更正记录同样拒绝。
+	if len(corr.OriginalAlertIDs) > 0 {
+		for _, oid := range corr.OriginalAlertIDs {
+			if sealed, err := e.alerts.IsSealed(oid); err == nil && sealed {
+				return corrPlan{}, ErrBackfillWindowCorrected
+			}
 		}
-		return got, true
+	}
+	if id, ok := e.alerts.WindowCorrection(g.tenantID, g.ruleID, g.entity, windowEnd); ok && id != corr.ID {
+		return corrPlan{}, ErrBackfillWindowCorrected
 	}
 
-	// changed/added：以重算窗口创建一条确定性的更正告警。
-	// 取与 windowEnd 对齐的重算决策作为更正告警载体（added 时唯一，changed 时取最右）。
-	var rep *detect.Decision
-	for i := range addedDecs {
-		d := addedDecs[i]
-		if rep == nil || d.FireAt.After(rep.FireAt) {
-			rep = &d
+	plan := corrPlan{corr: corr}
+	if corr.Kind != alert.CorrectionWithdrawn {
+		plan.corrected = &alert.Alert{
+			ID:       "corr:" + rep.FireID + ":" + req.RequestID,
+			TenantID: g.tenantID, RuleID: rep.RuleID, RuleVersion: rep.RuleVersion,
+			Entity: rep.Entity, CreatedAt: rep.FirstEventAt, FireAt: rep.FireAt,
+			EventIDs: append([]string{}, rep.EventIDs...),
 		}
 	}
-	if rep == nil {
-		// changed：交叉配对的最后一个重算窗口。
-		d := g.repl[replLeft[n-1]]
-		rep = &d
-	}
-	a := alert.Alert{
-		ID:          "corr:" + rep.FireID + ":" + req.RequestID,
-		TenantID:    g.tenantID, RuleID: rep.RuleID, RuleVersion: rep.RuleVersion,
-		Entity: rep.Entity, CreatedAt: rep.FirstEventAt, FireAt: rep.FireAt,
-		EventIDs: append([]string{}, rep.EventIDs...),
-	}
-	_, got, err := e.alerts.CreateCorrected(corr, a)
-	if err != nil {
-		return nil, false
-	}
-	return got, true
+	return plan, nil
 }
 
 // resolveAlertIDLocked 把重放基线决策映射到存储中的真实告警 ID。
-// 基线重放用的是全新关联器，FireID 的"该键第几次新发"序号与在线一致，
-// 但更正后的再次重放会让旧 FireID 指向已被取代的告警——这里统一通过
-// （规则,实体,穿越点 FireAt,合并事件集合）在存储中找到当前可见或已取代的原告警。
-// 调用方持锁。
+// 优先精确命中 FireID（在线与重放的确定性序号一致）；否则按
+// （规则,实体,合并事件集合）匹配，再退回到穿越点 FireAt 相同的告警；
+// 历史查询包含已被更正取代的旧结论。调用方持引擎锁。
 func (e *Engine) resolveAlertIDLocked(d detect.Decision) string {
 	want := sig(d.EventIDs)
 	var candidate string
-	for _, a := range e.alerts.List(d.TenantID) {
+	for _, a := range e.alerts.ListHistory(d.TenantID) {
 		if a.RuleID != d.RuleID || a.Entity != d.Entity {
 			continue
+		}
+		if a.ID == d.FireID {
+			return a.ID
 		}
 		if sig(a.EventIDs) == want {
 			return a.ID

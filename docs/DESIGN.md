@@ -110,7 +110,12 @@ open   --Ack-->     acked      （acked 上重复 Ack => 幂等命中，留痕 a
 open/acked --Close--> closed   （closed 上重复 Close => 幂等命中，留痕 already_closed）
 closed --Reopen-->  open       （open/acked 上重复 Reopen => 幂等命中，留痕 already_open）
 closed --Ack-->     错误 ErrInvalidTransition（须先 Reopen）
+open/acked/closed --回补更正--> superseded（终态：旧结论留痕，不再可处置、不在正常查询出现）
+superseded --Ack/Close/Reopen--> 错误 ErrAlertSuperseded
 ```
+
+`superseded` 是回补更正赋予**旧结论**的终态（见 §4A）：它保留可查但不再是活跃告警，
+正常查询 `List` 不返回，任何生命周期操作都被明确拒绝。
 
 幂等含义：相同操作重复提交不产生额外状态变化、不报错；但**每次调用都写一条审计**，
 可区分「真实转换」与「幂等命中」（`Reason` 与 `FromState/ToState` 相同与否）。
@@ -130,18 +135,102 @@ closed --Ack-->     错误 ErrInvalidTransition（须先 Reopen）
 ### 3.3 审计
 
 - 每条告警有按序号严格递增的审计视图：`create`、每次 `ack/close/reopen`（含幂等命中）、
-  每次 `suppress_merge`。
+  每次 `suppress_merge`；被回补取代时记录 `supersede`（旧终态）与更正告警的
+  `create_correction`（撤回另记 `withdraw_correction`），抑制命中重定向记
+  `suppress_merge_redirect`。
 - 存储还维护**全量有序审计链** `AuditTrail()`（含被拒绝的越权/跨租户/非法尝试），
   全局序号连续无缺口；`DeniedAttempts()` 提供拒绝视图。
 - 记录含操作者、租户、起止状态、墙钟时间与原因（「谁在什么时候因为什么改了什么」）。
 
 ## 4. 并发模型
 
-- `Engine` 以单一互斥锁串行化 `Ingest / Advance / Tick`：解析、入口判定、检测提交、
-  告警物化在临界区内顺序完成；`alert.Store` 亦自带锁。
-- 因此无论多少 goroutine、以何种交错顺序写入，只要喂入的**事件集合相同**
+- `Engine` 以单一互斥锁串行化 `Ingest / Advance / Tick / Backfill`：解析、入口判定、
+  检测提交、告警物化、回补重算与更正在同一临界区内顺序完成；`alert.Store` 亦自带锁。
+- 因此无论多少 goroutine、以何种交错顺序写入或回补，只要喂入的**事件集合相同**
   且最终断言水位相同，规则选择、窗口累计、抑制与告警 ID、合并事件集合就完全一致
-  （见 `TestEngineConcurrentWritersConsistent`，`go test -race` 验证无数据竞争）。
+  （见 `TestEngineConcurrentWritersConsistent`、`TestBackfillConcurrentOverlapStable`，
+  `go test -race` 验证无数据竞争）。
+
+## 4A. 受控回补与更正（Backfill & Correction）
+
+实现见 `internal/engine/backfill.go`、`internal/alert/correction.go`。
+
+### 4A.1 适用范围与边界
+
+运维确认上游补齐某段数据后，可按**租户 + 事件时间闭区间 `[Start,End]`** 主动发起一次
+受控回补，把此前因迟到被入口隔离的记录（或请求显式补投的记录）重新纳入检测。约束：
+
+- 必须提供 `RequestID`（调用方幂等键）、本租户身份与 `operator/admin` 角色；
+  `viewer` 拒绝（`ErrBackfillUnauthorized`），操作者租户与目标租户不一致拒绝
+  （`ErrBackfillCrossTenant`），与普通权限错误可区分。
+- 时间范围必须合法（零值/起止颠倒 → `ErrBackfillBadRange`），跨度不得超过
+  `MaxBackfillAge`（默认 24h，→ `ErrBackfillTooWide`），且 `End` 不得越过已断言
+  水位（只能回补已定论的历史，→ `ErrBackfillBeyondWatermark`）。
+- 只重算**穿越点 `FireAt` 落在区间内**的窗口；区间外、其它租户的既有结论一律不动。
+- 补入的历史事件按其**自身事件时间**匹配当时生效的规则版本（复用版本化规则集），
+  不会因为"现在规则变了"而用新版本重判旧事件。
+- 回补请求中无法解析、越出区间、与事件日志重复的补投记录不致命：按
+  `out_of_backfill_range / duplicate_event / parse_error/...` 进入 `SkippedExtra`，
+  其余记录照常处理；所有拒绝尝试写入全量审计链。
+
+### 4A.2 怎么判定"结论变了"（为什么结论不变时零噪音）
+
+回补用两个全新关联器分别重放：**基线**（事件日志，不含补入事件）与**重算**
+（事件日志 + 补入事件），重放不触碰在线关联器状态。抑制命中会先折叠进其所属主告警，
+因此比对单位是"一条完整结论 = 主告警合并的全部事件（含抑制追加）"。随后按
+`(规则,实体)` 分组、只保留区间内的穿越，再做两阶段对齐：
+
+1. 两侧某窗口的**合并事件集合完全相同** ⇒ 同一窗口、结论不变；
+2. 剩余窗口按穿越点有序两两配对：成对的是结论**变更（changed）**，
+   只在基线侧的是**撤回（withdrawn）**，只在重算侧的是**新增（added）**。
+
+"第几次新发"的序号漂移本身不算变化；只有窗口事件集合真正不同才产生更正。
+**结论不变时不产生任何告警、更正或状态变更**（`accepted_no_change`）。
+
+### 4A.3 更正结果的语义：唯一当前结论 + 旧结论留痕
+
+窗口身份是 `(租户, 规则, 实体, 时间窗)`，其中时间窗以**原结论穿越点**为锚
+（补入事件可能让重算穿越点发生位移，但它仍是"同一个窗口的更正"）。
+
+- 每个窗口**至多一条更正**（存储层维护窗口唯一索引）。更正生效时：
+  - 原结论告警**不删除、不改写内容**，而是进入新的终态 `superseded`，
+    并通过 `Alert.SupersededBy` 指向更正记录；
+  - 更正结论是一条独立的新告警（`IsCorrection`、`CorrectionID`），
+    `withdrawn` 时没有替代告警。
+- **正常查询 `Store.List` 只返回当前有效结论**：被取代的旧告警（以及任何被更正
+  记录引用为原结论的告警）不会出现，因此同一租户/规则/实体/时间窗在查询结果中
+  至多一条。需要留痕时用：
+  - `Store.Get(oldID)` 读旧告警本体（仍是 `superseded` 终态）；
+  - `Store.ListHistory(tenant)` 列出含旧结论在内的全部告警；
+  - `Store.GetCorrection(id)` / `ListCorrections(tenant)` 读不可变更正记录，
+    其中含 `OriginalAlertIDs`（旧结论）、`CorrectedAlertID`（新结论）、
+    `BaselineEventIDs / FinalEventIDs / AddedEventIDs`（原事件集、最终事件集、
+    本次补入事件）——旧结论 → 更正记录 → 补入事件的追溯链完整闭合。
+- **旧结论的状态不再自相矛盾**：`superseded` 是终态，`Ack/Close/Reopen` 一律返回
+  可区分的 `ErrAlertSuperseded`；它既不会在正常列表里看着"还能处置"，也不会被
+  真去处置时才拒绝。更正后的当前结论照常走 open/acked/closed 生命周期。
+- **同一窗口不能被再更正一次**：范围内若已存在定案更正，整次回补在重算前即被
+  拒绝（`ErrBackfillWindowCorrected`）；把更正告警当原结论再更正也同样拒绝
+  （`alert.ErrWindowAlreadyCorrected`），从引擎到存储双层拦截。
+- **原子性**：一次回补若涉及多个窗口，全部更正在存储的单个临界区内批量生效；
+  任一窗口冲突则整批回滚（撤销新告警、更正记录、终态标记并恢复审计快照），
+  绝不留下"部分窗口已更正"的中间状态。
+- **与在线抑制的衔接**：更正生效后，在线关联器的抑制期会被同步——
+  changed/add 时改挂到更正告警，withdrawn 时清除；若极端情况下在线抑制命中晚到
+  并指向已被取代的旧告警，存储会把合并**重定向**到当前更正告警，旧结论保持终态、
+  不被复活（撤回无替代告警时返回 `ErrAlertSuperseded`）。
+
+### 4A.4 幂等、并发与可复现
+
+- 同一 `RequestID` 重复或并发发起：首次结果登记在幂等台账，后续返回
+  `idempotent_replay` 与首次的更正/告警，绝不重复产出。
+- 不同 `RequestID` 但**互相重叠**的回补：引擎单锁串行化，先到者认领补入事件并
+  更正窗口；其余请求因区间命中定案窗口而**整批拒绝**（`ErrBackfillWindowCorrected`），
+  且不写入任何补入事件、不影响其它窗口与其它租户。因此无论多少个运维并发发起、
+  与查询/在线写入如何交叉，同一窗口最终可见结论恒为一条；给定相同事件集合与调用集合，
+  结果稳定可复现（测试以 1/8/16 并发度断言最终事件集合一致）。
+- 回补与 `Ingest/Advance` 共享同一把引擎锁，查询过程中不可能同时看到同窗口的
+  旧、新两条活跃结论。
 
 ## 5. 验证方法
 
@@ -149,7 +238,7 @@ closed --Ack-->     错误 ErrInvalidTransition（须先 Reopen）
 go test ./...                 # 全量单测
 go test -race ./...           # 竞态检测
 go test -v ./internal/...     # 查看含事件序列/时间基准/判定依据的日志
-go run ./cmd/sedemo           # 端到端演示（乱序/重复/并发/规则更新/权限/审计/隔离）
+go run ./cmd/sedemo           # 端到端演示（乱序/重复/并发/规则更新/权限/审计/隔离/回补更正）
 ```
 
 测试覆盖矩阵：
@@ -161,7 +250,36 @@ go run ./cmd/sedemo           # 端到端演示（乱序/重复/并发/规则更
 | 规则版本化、EffectiveAt 选择、非法版本 | `detect/ruleset_test.go` |
 | 阈值触发、窗口滑动、抑制合并、版本不混算、水位幂等、实体/租户 | `detect/correlator_test.go` |
 | 生命周期幂等、角色、跨租户、非法转换、审计链、并发唯一终态、合并幂等 | `alert/store_test.go` |
+| 更正后唯一可见+旧结论可追溯、窗口不可二次更正、撤回终态、抑制重定向、跨租户、并发唯一、批量原子回滚 | `alert/correction_test.go` |
 | 乱序+重复+多来源可复现、拒绝/迟到可区分、并发写入一致、未完成窗口收尾 | `engine/engine_test.go` |
+| 回补改结论唯一可见/可追溯、乱序+重复补投、同 ID 幂等、重叠/并发回补、跨租户、结论不变零噪音、与在线写入/抑制交叉、added | `engine/backfill_test.go` |
+
+### 5.1 在本地复现回补更正
+
+最快的方式是运行端到端演示（输出含"---- 1.5) 受控回补 ----"小节）：
+
+```bash
+go run ./cmd/sedemo
+```
+
+也可以直接运行针对性用例观察过程日志：
+
+```bash
+go test -v ./internal/engine/ -run TestBackfillChangedUniqueVisibleTraceable
+go test -v ./internal/engine/ -run TestBackfillConcurrentOverlapStable
+go test -v ./internal/alert/  -run TestCorrection
+go test -race -count=10 ./internal/engine/ -run TestBackfill   # 重压并发路径
+```
+
+手工复现"改结论"的最小序列（事件时间相对某个基准 `base`，窗口 1m、阈值 3）：
+
+1. 先喂 `f1@0s f2@20s f3@40s`，再 `Advance(base+10m)` ⇒ 产生一条 open 告警（合并 f1,f2,f3）；
+2. 补一条迟到记录 `f0@10s`（入口判 late 并隔离）；
+3. `Backfill(RequestID, [base-1m, base+10m])` ⇒ 状态 `applied_changed`，
+   窗口结论改为合并 `f0,f1,f2`；`List` 只剩更正后的一条，旧告警可经
+   `Get/ListHistory/GetCorrection` 追溯到本次补入的 `f0`；
+4. 用同一 `RequestID` 再发一次 ⇒ `idempotent_replay`；换一个 `RequestID` 再发
+   ⇒ `rejected` / `ErrBackfillWindowCorrected`，且结论与告警数量不变。
 
 单测日志会打印：时间基准（`time_base`）、断言水位、事件释放/合并序列、
 判定依据（`Decision.Reason`：阈值、窗口、右端时间、规则版本、FireID）、

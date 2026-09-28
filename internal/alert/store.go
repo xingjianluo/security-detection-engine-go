@@ -29,6 +29,7 @@ type Store struct {
 	denied      []AuditEntry            // 被拒绝操作视图
 	corrections map[string]*Correction  // correctionID -> 不可变更正记录
 	corrOrder   []string                // 更正记录 ID 的登记顺序
+	windowIdx   map[windowKey]string    // 窗口身份 -> 更正 ID（同窗口唯一可见结论）
 	seq         int64
 }
 
@@ -42,6 +43,7 @@ func NewStore(clock func() time.Time) *Store {
 		alerts:      map[string]*Alert{},
 		audit:       map[string][]AuditEntry{},
 		corrections: map[string]*Correction{},
+		windowIdx:   map[windowKey]string{},
 	}
 }
 
@@ -78,6 +80,10 @@ func (s *Store) Create(a Alert) (*Alert, error) {
 
 // MergeSuppressed 把一次抑制命中合并的事件 ID 追加到既有告警，并计数。
 // 重复的事件 ID 不会重复计入（幂等）。
+//
+// 若目标告警已被一次回补更正取代（superseded）：
+//   - 存在替代结论时，命中重定向合并到当前可见的更正告警（旧结论保持终态、不复活）；
+//   - 结论被撤回（无替代告警）时返回 ErrAlertSuperseded，由上层决定抑制期如何处理。
 func (s *Store) MergeSuppressed(alertID, tenantID string, eventIDs []string, fireID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -88,6 +94,22 @@ func (s *Store) MergeSuppressed(alertID, tenantID string, eventIDs []string, fir
 	if a.TenantID != tenantID {
 		s.recordDeniedLocked(a, Operator{TenantID: tenantID}, "suppress_merge", ErrCrossTenant)
 		return ErrCrossTenant
+	}
+	if a.Superseded {
+		if a.SupersededBy == "" {
+			return ErrAlertSuperseded
+		}
+		corr, ok := s.corrections[a.SupersededBy]
+		if !ok || corr.CorrectedAlertID == "" {
+			return ErrAlertSuperseded // 撤回结论：没有可承接的活跃告警
+		}
+		target := s.alerts[corr.CorrectedAlertID]
+		s.appendAuditLocked(AuditEntry{
+			AlertID: alertID, TenantID: tenantID, Action: "suppress_merge_redirect",
+			FromState: StatusSuperseded, ToState: StatusSuperseded, At: s.clock().UTC(),
+			Reason: "redirected suppressed hit " + fireID + " to corrected alert " + target.ID,
+		})
+		a = target // 后续合并写入替代结论
 	}
 	exist := map[string]bool{}
 	for _, id := range a.EventIDs {
@@ -107,7 +129,7 @@ func (s *Store) MergeSuppressed(alertID, tenantID string, eventIDs []string, fir
 		a.UpdatedAt = s.clock().UTC()
 	}
 	s.appendAuditLocked(AuditEntry{
-		AlertID: alertID, TenantID: tenantID, Action: "suppress_merge",
+		AlertID: a.ID, TenantID: tenantID, Action: "suppress_merge",
 		FromState: a.Status, ToState: a.Status, At: s.clock().UTC(),
 		Reason: "merged suppressed hit " + fireID + ": added " +
 			itoa(added) + " event(s)",
@@ -217,24 +239,14 @@ func (s *Store) Get(id string, op Operator) (*Alert, error) {
 	return &out, nil
 }
 
-// List 按租户列出告警（按创建事件时间排序）。
+// List 是正常业务查询：按租户列出【当前有效】的告警，即未被回补更正取代的
+// 最终结论；同一（规则,实体,时间窗）至多一条，按穿越点事件时间排序。
+// 被更正取代的旧结论（superseded 终态）不会出现，需要留痕追溯时用
+// Get / ListHistory / GetCorrection。
 func (s *Store) List(tenantID string) []*Alert {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []*Alert
-	for _, a := range s.alerts {
-		if a.TenantID == tenantID {
-			cp := *a
-			out = append(out, &cp)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
-			return out[i].CreatedAt.Before(out[j].CreatedAt)
-		}
-		return out[i].ID < out[j].ID
-	})
-	return out
+	return s.listByTenantLocked(tenantID, false)
 }
 
 // AuditLog 返回某条告警的全部审计记录（按序号有序）；跨租户拒绝。

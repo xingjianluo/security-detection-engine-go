@@ -10,6 +10,10 @@ const (
 	StatusOpen   Status = "open"
 	StatusAcked  Status = "acked" // 已确认
 	StatusClosed Status = "closed"
+	// StatusSuperseded 是终态：该时间窗的结论已被一次回补更正取代。
+	// 旧告警以该状态保留留痕，不再是活跃告警：不能再 Ack/Close/Reopen，
+	// 也不会出现在正常查询 List 的结果里（可用 Get / ListHistory / 更正记录追溯）。
+	StatusSuperseded Status = "superseded"
 )
 
 // Role 操作者角色。
